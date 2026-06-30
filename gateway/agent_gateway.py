@@ -11,8 +11,12 @@ from html.parser import HTMLParser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 
-LLM_BASE_URL = os.environ.get("LLM_BASE_URL") or os.environ.get("VLLM_BASE_URL", "http://vllm:8000/v1")
-LLM_BASE_URL = LLM_BASE_URL.rstrip("/")
+UPSTREAM_BASE_URL = (
+    os.environ.get("UPSTREAM_BASE_URL")
+    or os.environ.get("LLM_BASE_URL")
+    or os.environ.get("VLLM_BASE_URL")
+    or "http://vllm:8000/v1"
+).rstrip("/")
 SEARXNG_URL = os.environ.get("SEARXNG_URL", "http://searxng:8080/search")
 HOST = os.environ.get("GATEWAY_HOST", "0.0.0.0")
 PORT = int(os.environ.get("GATEWAY_PORT", "8010"))
@@ -476,7 +480,7 @@ def chat_completions(payload):
     agent_payload["stream"] = False
     messages = agent_payload["messages"]
     for _ in range(MAX_TOOL_ROUNDS):
-        response = request_json(LLM_BASE_URL + "/chat/completions", agent_payload)
+        response = request_json(UPSTREAM_BASE_URL + "/chat/completions", agent_payload)
         if not append_tool_results(messages, response):
             return response
     agent_payload.pop("tools", None)
@@ -487,7 +491,7 @@ def chat_completions(payload):
             "content": "Tool round limit reached. Answer with the evidence already collected.",
         }
     )
-    return request_json(LLM_BASE_URL + "/chat/completions", agent_payload)
+    return request_json(UPSTREAM_BASE_URL + "/chat/completions", agent_payload)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -499,11 +503,19 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         path = urllib.parse.urlparse(self.path).path.rstrip("/") or "/"
         if path == "/health":
-            json_response(self, 200, {"ok": True, "llm_base_url": LLM_BASE_URL, "searxng_url": SEARXNG_URL})
+            json_response(
+                self,
+                200,
+                {
+                    "ok": True,
+                    "upstream_base_url": UPSTREAM_BASE_URL,
+                    "searxng_url": SEARXNG_URL,
+                },
+            )
             return
         if path == "/v1/models":
             try:
-                json_response(self, 200, request_json(LLM_BASE_URL + "/models"))
+                json_response(self, 200, request_json(UPSTREAM_BASE_URL + "/models"))
             except Exception as exc:
                 if MODEL_LIST_FALLBACK:
                     payload = fallback_models_response()
@@ -539,7 +551,7 @@ class Handler(BaseHTTPRequestHandler):
 
 def main():
     server = ThreadingHTTPServer((HOST, PORT), Handler)
-    print("agent-gateway listening on {}:{} -> {}".format(HOST, PORT, LLM_BASE_URL), flush=True)
+    print("agent-gateway listening on {}:{} -> {}".format(HOST, PORT, UPSTREAM_BASE_URL), flush=True)
     server.serve_forever()
 
 
