@@ -1,0 +1,30 @@
+FROM nvidia/cuda:12.9.1-devel-ubuntu24.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV CUDA_HOME=/usr/local/cuda
+ENV PATH=${CUDA_HOME}/bin:${PATH}
+ENV LD_LIBRARY_PATH=${CUDA_HOME}/lib64:${LD_LIBRARY_PATH}
+ENV CC=/usr/bin/gcc-14
+ENV CXX=/usr/bin/g++-14
+
+RUN apt update && apt install -y \
+    python3.12 python3.12-venv python3-pip \
+    gcc-14 g++-14 git curl ninja-build \
+ && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+RUN python3.12 -m venv /opt/vllm-env
+ENV PATH=/opt/vllm-env/bin:$PATH
+
+RUN pip install -U pip setuptools wheel
+
+RUN pip install torch torchvision torchaudio \
+    --index-url https://download.pytorch.org/whl/cu129
+
+RUN pip install vllm==0.23.0 \
+    --extra-index-url https://wheels.vllm.ai/0.23.0/cu129
+
+RUN pip install openai
+
+ENTRYPOINT ["vllm", "serve"]
