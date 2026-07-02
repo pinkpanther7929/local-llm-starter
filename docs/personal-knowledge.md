@@ -2,7 +2,7 @@
 
 [Korean](personal-knowledge.ko.md)
 
-Phase 2 starts with read-only local file tools in `agent-gateway`.
+Use read-only local file tools from `agent-gateway` to search configured folders and read short file excerpts.
 
 ## Tools
 
@@ -35,7 +35,7 @@ docker compose --profile vllm up -d --build
 ## Policies
 
 - `WEB_SEARCH_POLICY=keyword|question|always|off`
-- `FILE_SEARCH_POLICY=keyword|always|off` (`keyword` and `always` both expose the tools in this first version; `off` hides them.)
+- `FILE_SEARCH_POLICY=keyword|always|off`
 - `FETCH_URL_ENABLED=true|false`
 - `FILE_SEARCH_ENABLED=true|false`
 
@@ -47,4 +47,4 @@ docker compose --profile vllm up -d --build
 - Binary files are skipped.
 - Common generated folders such as `.git`, `node_modules`, `build`, and `dist` are skipped.
 
-This first version is keyword-based RAG-lite. Embeddings can be added later after the read-only path and policy contract are stable.
+Search is keyword-based and limited to configured read-only paths.

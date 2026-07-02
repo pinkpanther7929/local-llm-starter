@@ -2,7 +2,7 @@
 
 [English](personal-knowledge.md)
 
-Phase 2의 첫 단계로 `agent-gateway`에 read-only local file tool을 추가합니다.
+`agent-gateway`에서 설정된 폴더를 검색하고 짧은 파일 일부를 읽기 위한 read-only local file tool입니다.
 
 ## 도구
 
@@ -35,7 +35,7 @@ Container 내부 `FILE_SEARCH_PATHS`는 `docker-compose.yml`에서 `FILE_SEARCH_
 ## Policy
 
 - `WEB_SEARCH_POLICY=keyword|question|always|off`
-- `FILE_SEARCH_POLICY=keyword|always|off` (첫 버전에서는 `keyword`와 `always` 모두 tool을 노출하고, `off`는 숨깁니다.)
+- `FILE_SEARCH_POLICY=keyword|always|off`
 - `FETCH_URL_ENABLED=true|false`
 - `FILE_SEARCH_ENABLED=true|false`
 
@@ -47,4 +47,4 @@ Container 내부 `FILE_SEARCH_PATHS`는 `docker-compose.yml`에서 `FILE_SEARCH_
 - Binary file은 skip합니다.
 - `.git`, `node_modules`, `build`, `dist` 같은 generated folder는 skip합니다.
 
-첫 버전은 keyword 기반 RAG-lite입니다. Embedding은 read-only path와 policy contract가 안정된 뒤 추가합니다.
+검색은 keyword 기반이며, 설정된 read-only path 안에서만 동작합니다.
