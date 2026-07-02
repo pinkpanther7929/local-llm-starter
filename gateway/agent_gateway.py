@@ -29,15 +29,50 @@ FETCH_MAX_CHARS = int(os.environ.get("FETCH_MAX_CHARS", "12000"))
 SEARCH_RESULT_LIMIT = int(os.environ.get("SEARCH_RESULT_LIMIT", "5"))
 DEFAULT_MODEL = os.environ.get("DEFAULT_MODEL", "qwen-14b")
 AUTO_SEARCH = os.environ.get("AUTO_SEARCH", "true").lower() not in {"0", "false", "no"}
+WEB_SEARCH_POLICY = os.environ.get("WEB_SEARCH_POLICY", "keyword" if AUTO_SEARCH else "off").lower()
+FETCH_URL_ENABLED = os.environ.get("FETCH_URL_ENABLED", "true").lower() not in {"0", "false", "no"}
 MODEL_LIST_FALLBACK = os.environ.get("MODEL_LIST_FALLBACK", "true").lower() not in {"0", "false", "no"}
+FILE_SEARCH_ENABLED = os.environ.get("FILE_SEARCH_ENABLED", "false").lower() in {"1", "true", "yes"}
+FILE_SEARCH_POLICY = os.environ.get("FILE_SEARCH_POLICY", "keyword").lower()
+FILE_SEARCH_RESULT_LIMIT = int(os.environ.get("FILE_SEARCH_RESULT_LIMIT", "5"))
+FILE_SEARCH_MAX_FILE_BYTES = int(os.environ.get("FILE_SEARCH_MAX_FILE_BYTES", "262144"))
+FILE_SEARCH_MAX_CHARS = int(os.environ.get("FILE_SEARCH_MAX_CHARS", "1200"))
+FILE_READ_MAX_LINES = int(os.environ.get("FILE_READ_MAX_LINES", "120"))
+FILE_SEARCH_EXTENSIONS = {
+    item.strip().lower()
+    for item in os.environ.get(
+        "FILE_SEARCH_EXTENSIONS",
+        ".txt,.md,.rst,.py,.ps1,.bat,.cmd,.sh,.json,.yaml,.yml,.toml,.ini,.cfg,.xml,.html,.css,.js,.ts,.cs,.cpp,.h,.hpp,.java,.go,.rs,.sql,.log",
+    ).split(",")
+    if item.strip()
+}
+
+
+def parse_path_list(value):
+    paths = []
+    for chunk in (value or "").replace("\n", ";").split(";"):
+        path = chunk.strip()
+        if path:
+            paths.append(os.path.realpath(path))
+    return paths
+
+
+FILE_SEARCH_PATHS = parse_path_list(os.environ.get("FILE_SEARCH_PATHS", ""))
+FILE_TOOLS_ENABLED = FILE_SEARCH_ENABLED and FILE_SEARCH_POLICY != "off"
+WEB_TOOLS_ENABLED = WEB_SEARCH_POLICY != "off"
 
 SYSTEM_TOOL_HINT = (
-    "You can use tools for current web information. "
-    "Use search_web for discovery and fetch_url to read a result page. "
+    "You can use enabled tools for current web information and configured local files. "
+    "Use search_web for web discovery and fetch_url to read a result page when web tools are enabled. "
     "Cite source URLs in the final answer when web tools are used. "
     "Do not print tool call XML or JSON in the answer. "
     "Do not ask the user to wait; call a tool or answer with the evidence already provided."
 )
+if FILE_TOOLS_ENABLED:
+    SYSTEM_TOOL_HINT += (
+        " You can also use local read-only file tools when the user asks about configured local files, notes, or code. "
+        "Use search_files to find evidence and read_file_excerpt to inspect a small line range."
+    )
 
 BLOCKED_HOSTS = {"localhost", "localhost.localdomain"}
 
@@ -269,6 +304,140 @@ def tool_fetch_url(arguments):
     return {"url": url, "content_type": content_type, "truncated": truncated, "text": text}
 
 
+SKIP_DIRS = {".git", ".hg", ".svn", "__pycache__", ".pytest_cache", ".venv", "node_modules", "dist", "build"}
+
+
+def require_file_search_enabled():
+    if not FILE_TOOLS_ENABLED:
+        raise ValueError("Local file search is disabled.")
+    if not FILE_SEARCH_PATHS:
+        raise ValueError("FILE_SEARCH_PATHS is empty.")
+
+
+def is_within_root(path, root):
+    try:
+        common = os.path.commonpath([os.path.realpath(path), os.path.realpath(root)])
+    except ValueError:
+        return False
+    return common == os.path.realpath(root)
+
+
+def resolve_allowed_file(path):
+    require_file_search_enabled()
+    requested = str(path or "").strip()
+    if not requested:
+        raise ValueError("path is required")
+    candidates = []
+    if os.path.isabs(requested):
+        candidates.append(os.path.realpath(requested))
+    else:
+        for root in FILE_SEARCH_PATHS:
+            candidates.append(os.path.realpath(os.path.join(root, requested)))
+    for candidate in candidates:
+        if any(is_within_root(candidate, root) for root in FILE_SEARCH_PATHS) and os.path.isfile(candidate):
+            return candidate
+    raise ValueError("File is outside configured paths or does not exist.")
+
+
+def relative_to_allowed_root(path):
+    for root in FILE_SEARCH_PATHS:
+        if is_within_root(path, root):
+            return os.path.relpath(path, root).replace("\\", "/")
+    return path
+
+
+def is_searchable_file(path):
+    try:
+        if os.path.getsize(path) > FILE_SEARCH_MAX_FILE_BYTES:
+            return False
+    except OSError:
+        return False
+    _, ext = os.path.splitext(path)
+    return ext.lower() in FILE_SEARCH_EXTENSIONS
+
+
+def read_text_file(path, max_bytes=FILE_SEARCH_MAX_FILE_BYTES):
+    with open(path, "rb") as handle:
+        raw = handle.read(max_bytes + 1)
+    if b"\x00" in raw:
+        raise ValueError("Binary file skipped.")
+    return raw[:max_bytes].decode("utf-8", errors="replace"), len(raw) > max_bytes
+
+
+def tool_search_files(arguments):
+    require_file_search_enabled()
+    query = str(arguments.get("query") or "").strip()
+    if not query:
+        raise ValueError("query is required")
+    limit = max(1, min(int(arguments.get("limit") or FILE_SEARCH_RESULT_LIMIT), FILE_SEARCH_RESULT_LIMIT))
+    terms = [term.lower() for term in re.findall(r"[\w./:-]+", query) if term.strip()]
+    if not terms:
+        terms = [query.lower()]
+    results = []
+    for root in FILE_SEARCH_PATHS:
+        if not os.path.isdir(root):
+            continue
+        for current_root, dirnames, filenames in os.walk(root):
+            dirnames[:] = [name for name in dirnames if name not in SKIP_DIRS]
+            for filename in filenames:
+                path = os.path.join(current_root, filename)
+                if not is_searchable_file(path):
+                    continue
+                try:
+                    text, truncated = read_text_file(path)
+                except (OSError, ValueError):
+                    continue
+                lowered = text.lower()
+                score = sum(lowered.count(term) for term in terms)
+                if score <= 0:
+                    continue
+                snippets = []
+                for line_number, line in enumerate(text.splitlines(), start=1):
+                    line_lower = line.lower()
+                    if any(term in line_lower for term in terms):
+                        snippets.append(
+                            {
+                                "line": line_number,
+                                "text": line.strip()[:FILE_SEARCH_MAX_CHARS],
+                            }
+                        )
+                    if len(snippets) >= 3:
+                        break
+                results.append(
+                    {
+                        "path": path,
+                        "relative_path": relative_to_allowed_root(path),
+                        "score": score,
+                        "truncated": truncated,
+                        "snippets": snippets,
+                    }
+                )
+    results.sort(key=lambda item: item["score"], reverse=True)
+    return {
+        "query": query,
+        "roots": FILE_SEARCH_PATHS,
+        "results": results[:limit],
+    }
+
+
+def tool_read_file_excerpt(arguments):
+    path = resolve_allowed_file(arguments.get("path"))
+    start_line = max(1, int(arguments.get("start_line") or 1))
+    max_lines = max(1, min(int(arguments.get("max_lines") or FILE_READ_MAX_LINES), FILE_READ_MAX_LINES))
+    text, truncated = read_text_file(path)
+    lines = text.splitlines()
+    start_index = min(start_line - 1, len(lines))
+    selected = lines[start_index : start_index + max_lines]
+    return {
+        "path": path,
+        "relative_path": relative_to_allowed_root(path),
+        "start_line": start_index + 1 if lines else 1,
+        "end_line": start_index + len(selected),
+        "truncated": truncated,
+        "text": "\n".join(selected),
+    }
+
+
 TOOLS = [
     {
         "type": "function",
@@ -305,6 +474,57 @@ TOOL_HANDLERS = {
     "search_web": tool_search_web,
     "fetch_url": tool_fetch_url,
 }
+
+if not WEB_TOOLS_ENABLED:
+    TOOLS = [tool for tool in TOOLS if tool.get("function", {}).get("name") not in {"search_web", "fetch_url"}]
+    TOOL_HANDLERS.pop("search_web", None)
+    TOOL_HANDLERS.pop("fetch_url", None)
+elif not FETCH_URL_ENABLED:
+    TOOLS = [tool for tool in TOOLS if tool.get("function", {}).get("name") != "fetch_url"]
+    TOOL_HANDLERS.pop("fetch_url", None)
+
+if FILE_TOOLS_ENABLED:
+    TOOLS.extend(
+        [
+            {
+                "type": "function",
+                "function": {
+                    "name": "search_files",
+                    "description": "Search configured local read-only file paths and return matching files with short line snippets.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "query": {"type": "string", "description": "Keyword query."},
+                            "limit": {"type": "integer", "description": "Maximum result count."},
+                        },
+                        "required": ["query"],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "read_file_excerpt",
+                    "description": "Read a small line range from a file under configured local read-only file paths.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "path": {"type": "string", "description": "Absolute path or path relative to a configured root."},
+                            "start_line": {"type": "integer", "description": "1-based start line."},
+                            "max_lines": {"type": "integer", "description": "Maximum lines to read."},
+                        },
+                        "required": ["path"],
+                    },
+                },
+            },
+        ]
+    )
+    TOOL_HANDLERS.update(
+        {
+            "search_files": tool_search_files,
+            "read_file_excerpt": tool_read_file_excerpt,
+        }
+    )
 
 
 def parse_tool_arguments(value):
@@ -395,9 +615,13 @@ def last_user_text(messages):
 
 
 def should_auto_search(text):
-    if not AUTO_SEARCH:
+    if WEB_SEARCH_POLICY == "off":
         return False
+    if WEB_SEARCH_POLICY == "always":
+        return True
     lowered = (text or "").lower()
+    if WEB_SEARCH_POLICY == "question" and ("?" in lowered or "what" in lowered or "how" in lowered or "why" in lowered):
+        return True
     triggers = [
         "web",
         "search",
