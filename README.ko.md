@@ -94,7 +94,7 @@ PyTorch: CUDA 12.9 wheels
 vLLM: 0.23.0 from wheels.vllm.ai/0.23.0/cu129
 Model: Qwen/Qwen3-14B-AWQ
 Served model name: qwen-14b
-Max model length: 8192
+Max model length: 12288
 ```
 
 ## 메모

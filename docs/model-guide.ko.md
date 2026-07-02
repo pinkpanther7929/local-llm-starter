@@ -18,7 +18,7 @@ docker compose --env-file profiles/vllm-qwen3-14b-awq.env --profile vllm up -d -
 
 - `MODEL_ID=Qwen/Qwen3-14B-AWQ`
 - `SERVED_MODEL_NAME=qwen-14b`
-- `MAX_MODEL_LEN=8192`
+- `MAX_MODEL_LEN=12288`
 - `GPU_MEMORY_UTILIZATION=0.85`
 
 ### `profiles/vllm-qwen3-14b-awq-safe.env`
