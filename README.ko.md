@@ -112,6 +112,7 @@ Max model length: 12288
 ## 문서
 
 - [모델 가이드](docs/model-guide.ko.md)
+- [개인 지식 도구](docs/personal-knowledge.ko.md)
 - [문제 해결](docs/troubleshooting.ko.md)
 
 ## Jenkins Failure Analysis

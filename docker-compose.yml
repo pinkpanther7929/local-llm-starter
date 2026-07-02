@@ -120,9 +120,17 @@ services:
       UPSTREAM_BASE_URL: ${UPSTREAM_BASE_URL:-http://vllm:8000/v1}
       SEARXNG_URL: http://searxng:8080/search
       DEFAULT_MODEL: ${SERVED_MODEL_NAME:-qwen-14b}
+      WEB_SEARCH_POLICY: ${WEB_SEARCH_POLICY:-keyword}
+      FETCH_URL_ENABLED: ${FETCH_URL_ENABLED:-true}
+      FILE_SEARCH_ENABLED: ${FILE_SEARCH_ENABLED:-false}
+      FILE_SEARCH_POLICY: ${FILE_SEARCH_POLICY:-keyword}
+      FILE_SEARCH_PATHS: ${FILE_SEARCH_CONTAINER_PATH:-/knowledge}
       MAX_TOOL_ROUNDS: ${MAX_TOOL_ROUNDS:-4}
       UPSTREAM_RETRIES: ${UPSTREAM_RETRIES:-6}
       UPSTREAM_RETRY_DELAY_SECONDS: ${UPSTREAM_RETRY_DELAY_SECONDS:-2}
+
+    volumes:
+      - ${FILE_SEARCH_HOST_PATH:-./knowledge}:${FILE_SEARCH_CONTAINER_PATH:-/knowledge}:ro
 
     depends_on:
       - searxng
