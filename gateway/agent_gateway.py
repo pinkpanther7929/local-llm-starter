@@ -383,12 +383,15 @@ def tool_search_files(arguments):
                 path = os.path.join(current_root, filename)
                 if not is_searchable_file(path):
                     continue
+                relative_path = relative_to_allowed_root(path)
+                relative_lower = relative_path.lower()
+                path_score = sum(3 for term in terms if term in relative_lower)
                 try:
                     text, truncated = read_text_file(path)
                 except (OSError, ValueError):
                     continue
                 lowered = text.lower()
-                score = sum(lowered.count(term) for term in terms)
+                score = path_score + sum(lowered.count(term) for term in terms)
                 if score <= 0:
                     continue
                 snippets = []
@@ -403,10 +406,12 @@ def tool_search_files(arguments):
                         )
                     if len(snippets) >= 3:
                         break
+                if not snippets and path_score:
+                    snippets.append({"line": 0, "text": "Path match"})
                 results.append(
                     {
                         "path": path,
-                        "relative_path": relative_to_allowed_root(path),
+                        "relative_path": relative_path,
                         "score": score,
                         "truncated": truncated,
                         "snippets": snippets,
@@ -593,6 +598,7 @@ def with_gateway_tools(payload):
     payload.setdefault("chat_template_kwargs", {"enable_thinking": False})
     messages = list(payload.get("messages") or [])
     messages.insert(0, {"role": "system", "content": SYSTEM_TOOL_HINT})
+    add_auto_file_context(messages)
     add_auto_search_context(messages)
     payload["messages"] = messages
     return payload
@@ -620,6 +626,8 @@ def should_auto_search(text):
     if WEB_SEARCH_POLICY == "always":
         return True
     lowered = (text or "").lower()
+    if "local file" in lowered and "only" in lowered:
+        return False
     if WEB_SEARCH_POLICY == "question" and ("?" in lowered or "what" in lowered or "how" in lowered or "why" in lowered):
         return True
     triggers = [
@@ -669,6 +677,85 @@ def add_auto_search_context(messages):
             {
                 "role": "system",
                 "content": "Auto web search failed: {}".format(exc),
+            }
+        )
+
+
+def extract_requested_line_count(text):
+    matches = [
+        r"first\s+(\d+)\s+lines?",
+        r"(\d+)\s+lines?",
+    ]
+    for pattern in matches:
+        match = re.search(pattern, text or "", flags=re.IGNORECASE)
+        if match:
+            return max(1, min(int(match.group(1)), FILE_READ_MAX_LINES))
+    return min(80, FILE_READ_MAX_LINES)
+
+
+def extract_local_file_paths(text):
+    candidates = []
+    patterns = [
+        r"(?:/knowledge/)?[A-Za-z0-9_.-]+(?:[\\/][A-Za-z0-9_.-]+)+\.[A-Za-z0-9_.+-]+",
+        r"[A-Za-z0-9_.-]+(?:[\\/][A-Za-z0-9_.-]+)+",
+    ]
+    for pattern in patterns:
+        for match in re.finditer(pattern, text or ""):
+            candidate = match.group(0).strip("`'\".,:;()[]{}")
+            if candidate and candidate not in candidates:
+                candidates.append(candidate)
+    return candidates
+
+
+def should_auto_file_search(text):
+    if not FILE_TOOLS_ENABLED:
+        return False
+    if FILE_SEARCH_POLICY == "always":
+        return True
+    lowered = (text or "").lower()
+    triggers = [
+        "local file",
+        "local files",
+        "search_files",
+        "read_file_excerpt",
+        "find ",
+        "search ",
+        "read ",
+        "file path",
+        "snippet",
+    ]
+    return any(trigger in lowered for trigger in triggers)
+
+
+def add_auto_file_context(messages):
+    query = last_user_text(messages)
+    if not should_auto_file_search(query):
+        return
+    paths = extract_local_file_paths(query)
+    try:
+        if paths:
+            excerpts = []
+            max_lines = extract_requested_line_count(query)
+            for path in paths[:FILE_SEARCH_RESULT_LIMIT]:
+                excerpts.append(
+                    tool_read_file_excerpt(
+                        {
+                            "path": path,
+                            "start_line": 1,
+                            "max_lines": max_lines,
+                        }
+                    )
+                )
+            content = "Auto local file excerpts:\n{}".format(json.dumps(excerpts, ensure_ascii=False))
+        else:
+            result = tool_search_files({"query": query, "limit": FILE_SEARCH_RESULT_LIMIT})
+            content = "Auto local file search results:\n{}".format(json.dumps(result, ensure_ascii=False))
+        messages.append({"role": "system", "content": content})
+    except Exception as exc:
+        messages.append(
+            {
+                "role": "system",
+                "content": "Auto local file context failed: {}".format(exc),
             }
         )
 
