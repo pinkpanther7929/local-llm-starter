@@ -73,6 +73,13 @@ curl http://localhost:8010/v1/models
 curl "http://localhost:8081/search?q=vllm&format=json"
 ```
 
+Host readiness and runtime smoke tests:
+
+```bash
+scripts/check-host.sh
+scripts/smoke-test.sh
+```
+
 Agent gateway web answer check:
 
 ```bash
@@ -112,6 +119,7 @@ Max model length: 12288
 ## Docs
 
 - [Model Guide](docs/model-guide.md)
+- [Operations](docs/operations.md)
 - [Personal Knowledge Tools](docs/personal-knowledge.md)
 - [Troubleshooting](docs/troubleshooting.md)
 
