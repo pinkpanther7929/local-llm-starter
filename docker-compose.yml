@@ -30,6 +30,10 @@ services:
       CC: /usr/bin/gcc-14
       CXX: /usr/bin/g++-14
 
+      # FlashInfer sampling kernels hang the GPU on Ada under sustained load,
+      # which drops the card off the PCIe bus and needs a host reboot.
+      VLLM_USE_FLASHINFER_SAMPLER: "${VLLM_USE_FLASHINFER_SAMPLER:-0}"
+
     command:
       - ${MODEL_ID:-Qwen/Qwen3-14B-AWQ}
 
