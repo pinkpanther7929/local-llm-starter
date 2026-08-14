@@ -33,6 +33,7 @@ services:
       # FlashInfer sampling kernels hang the GPU on Ada under sustained load,
       # which drops the card off the PCIe bus and needs a host reboot.
       VLLM_USE_FLASHINFER_SAMPLER: "${VLLM_USE_FLASHINFER_SAMPLER:-0}"
+      VLLM_ALLOW_LONG_MAX_MODEL_LEN: "${VLLM_ALLOW_LONG_MAX_MODEL_LEN:-0}"
 
     command:
       - ${MODEL_ID:-Qwen/Qwen3-14B-AWQ}
@@ -51,6 +52,18 @@ services:
 
       - --gpu-memory-utilization
       - "${GPU_MEMORY_UTILIZATION:-0.85}"
+
+      - --kv-cache-dtype
+      - "${KV_CACHE_DTYPE:-auto}"
+
+      - --generation-config
+      - vllm
+
+      - --chat-template-content-format
+      - string
+
+      - --hf-overrides
+      - "${HF_OVERRIDES:-{}}"
 
       - --reasoning-parser
       - qwen3
