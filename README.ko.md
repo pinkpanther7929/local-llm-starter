@@ -30,6 +30,14 @@ docker compose --profile vllm up -d --build
 docker compose --env-file profiles/vllm-qwen3-14b-awq.env --profile vllm up -d --build
 ```
 
+64K context 실험 profile도 있습니다:
+
+```bash
+docker compose --env-file profiles/vllm-qwen3-14b-awq-64k.env --profile vllm up -d --build
+```
+
+이 profile은 `KV_CACHE_DTYPE=fp8`, `VLLM_ALLOW_LONG_MAX_MODEL_LEN=1`, YaRN `HF_OVERRIDES`를 사용합니다. 모델 config의 기본 한계를 넘기는 실험 설정이므로 결과 품질과 안정성은 별도 확인이 필요합니다.
+
 ### Ollama
 
 `.env`를 수정합니다:
@@ -63,6 +71,14 @@ Backend OpenAI-compatible API:
 Open WebUI: http://localhost:3000
 SearXNG: http://localhost:8081
 Agent gateway OpenAI-compatible API: http://localhost:8010/v1
+```
+
+Open WebUI가 안 뜨면 컨테이너가 실제로 생성됐는지 먼저 확인합니다:
+
+```bash
+docker compose ps
+docker compose up -d open-webui agent-gateway searxng
+docker logs --tail=100 open-webui
 ```
 
 ## 확인
@@ -103,6 +119,18 @@ Model: Qwen/Qwen3-14B-AWQ
 Served model name: qwen-14b
 Max model length: 12288
 ```
+
+64K 실험에서 확인한 값:
+
+```text
+MAX_MODEL_LEN=65536
+GPU_MEMORY_UTILIZATION=0.95
+KV_CACHE_DTYPE=fp8
+VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
+HF_OVERRIDES={"rope_scaling":{"rope_type":"yarn","factor":2.0,"original_max_position_embeddings":32768}}
+```
+
+vLLM 실행 옵션에는 `--generation-config vllm`을 넣어 모델의 `generation_config.json`이 temperature/top_p/top_k 기본값을 덮어쓰지 않게 했습니다. `--chat-template-content-format string`도 명시해서 자동 감지 로그를 줄입니다.
 
 ## 메모
 
