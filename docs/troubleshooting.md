@@ -60,8 +60,19 @@ retrains to 16 GT/s under load. Combined with the card dying at its lowest power
 state, the low-power transitions themselves are the strongest candidate:
 
 1. Keep the card out of its deepest idle state, which suppresses both the P8
-   power state and the idle link downshift. Install it as a unit, because a
-   crash reboot would otherwise silently end the trial:
+   power state and the idle link downshift. The memory clock is the lever here.
+   Locking the graphics clock alone raised the SM floor to 510 MHz and changed
+   nothing else: the card stayed in P8 and the link stayed at 2.5 GT/s. Locking
+   the memory clock moved it to P2 and held the link at 16 GT/s.
+
+   Read the maximum first, since `-lmc` snaps to a supported step:
+
+   ```bash
+   nvidia-smi --query-gpu=clocks.max.mem --format=csv,noheader
+   ```
+
+   Install it as a unit, because a crash reboot would otherwise drop the lock
+   and silently end the trial it was meant to run:
 
    ```ini
    # /etc/systemd/system/gpu-clocklock.service
@@ -74,13 +85,22 @@ state, the low-power transitions themselves are the strongest candidate:
    RemainAfterExit=yes
    ExecStart=/usr/bin/nvidia-smi -pm 1
    ExecStart=/usr/bin/nvidia-smi -lgc 510,2565
+   ExecStart=/usr/bin/nvidia-smi -lmc 10501
    ExecStop=/usr/bin/nvidia-smi -rgc
+   ExecStop=/usr/bin/nvidia-smi -rmc
 
    [Install]
    WantedBy=multi-user.target
    ```
 
-   Idle draw rises from about 21 W to 40-60 W. That is the cost.
+   Verify all three, not just the service state:
+
+   ```bash
+   nvidia-smi --query-gpu=pstate,clocks.sm,clocks.mem,power.draw --format=csv,noheader
+   sudo lspci -vv -s 00:01.0 | grep "LnkSta:"
+   ```
+
+   Idle draw rises from about 21 W to 44 W. That is the cost.
 2. Disable PCIe power management: `pcie_aspm=off pcie_port_pm=off` on the kernel
    command line. Worth keeping since it also disables the PCI-PM L1 substates,
    but do not expect much where the root port has no ASPM to begin with.
