@@ -36,8 +36,13 @@ FlashInfer kernels have hung this card before, on both the sampler and the
 attention path. Check which backend was selected:
 
 ```bash
-docker logs vllm 2>&1 | grep -i "attention backend"
+docker logs vllm 2>&1 | grep -iE "attention.?backend"
 ```
+
+The pattern has to match both log lines. Auto-selection logs `Using X attention
+backend out of potential backends`, while an explicitly pinned backend takes a
+different branch and logs `Using AttentionBackendEnum.X backend`. Matching only
+the first makes a correctly pinned server look like it printed nothing.
 
 If it picked `FLASHINFER`, pin `ATTENTION_BACKEND`, which is passed through as
 vLLM's `--attention-backend` flag. The `VLLM_ATTENTION_BACKEND` environment

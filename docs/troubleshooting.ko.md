@@ -34,8 +34,10 @@ collector를 미리 걸어두는 방법은 [GPU Hang 증거 수집](operations.k
 이 카드에서는 FlashInfer kernel이 GPU를 매달아 놓은 전례가 있습니다. sampler와 attention 두 경로 모두 확인합니다:
 
 ```bash
-docker logs vllm 2>&1 | grep -i "attention backend"
+docker logs vllm 2>&1 | grep -iE "attention.?backend"
 ```
+
+두 형태의 로그를 모두 잡아야 합니다. 자동 선택은 `Using X attention backend out of potential backends`를 찍지만, backend를 명시하면 다른 분기를 타서 `Using AttentionBackendEnum.X backend`를 찍습니다. 앞쪽만 검색하면 제대로 고정된 서버가 아무것도 출력하지 않은 것처럼 보입니다.
 
 `FLASHINFER`가 선택됐다면 `ATTENTION_BACKEND`로 고정합니다. 이 값은 vLLM의 `--attention-backend` flag로 전달됩니다. vLLM 0.23에서 `VLLM_ATTENTION_BACKEND` 환경변수는 제거됐으므로 환경변수로는 고정되지 않습니다.
 
