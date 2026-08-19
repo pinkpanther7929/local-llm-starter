@@ -31,6 +31,20 @@ Host에서 `Xid 79`, `GPU has fallen off the bus`, `No devices were found`가 �
 hang 이후에는 `scripts/gpu-watch.sh report`로 `Xid`와 직전 telemetry를 확인합니다.
 collector를 미리 걸어두는 방법은 [GPU Hang 증거 수집](operations.ko.md#gpu-hang-증거-수집)을 참고합니다.
 
+### 유휴 상태에서 발생한 Xid 79
+
+먼저 gap 직전 sample의 utilization 열을 봅니다. 아래의 vLLM 튜닝이 애초에 관련 있는지를 이 열이 결정합니다.
+
+이 host에서는 카드가 0% utilization, 210MHz, 21W — 최저 전력 상태에서 버스에서 떨어졌습니다. CUDA kernel이 돌지 않았고, 선행하는 AER이나 `pcieport` 오류도 없었습니다. vLLM이 하는 어떤 일도 이런 고장을 만들 수 없습니다. 유휴 상태의 `Xid 79`는 PCIe link, 전력 상태 전환, 카드 전원 공급 쪽을 가리킵니다. host 레벨 변경을 **한 번에 하나씩** 적용하고 `gpu-watch`로 판정합니다.
+
+1. PCIe ASPM 비활성화. consumer board에서 유휴 중 버스 이탈의 가장 흔한 원인입니다. kernel command line에 `pcie_aspm=off pcie_port_pm=off`를 추가하고, firmware가 kernel 설정을 덮을 수 있으므로 BIOS에서도 ASPM을 끕니다.
+2. BIOS에서 Resizable BAR 비활성화.
+3. 카드가 최저 유휴 상태로 내려가지 않게 고정: `nvidia-smi -pm 1` 및 `nvidia-smi -lgc 510,2565`. 유휴 전력과 발열이 늘어나므로 위 두 BIOS 변경 이후에 시도합니다.
+4. BIOS에서 PCIe link 속도를 Gen3로 제한.
+5. 카드와 전원 케이블 재장착, 12VHPWR connector 점검.
+
+이 host의 MTBF는 42분에서 17시간까지 편차가 큽니다. 각 변경은 최소 48시간 관찰 후 판정합니다.
+
 이 카드에서는 FlashInfer kernel이 GPU를 매달아 놓은 전례가 있습니다. sampler와 attention 두 경로 모두 확인합니다:
 
 ```bash
