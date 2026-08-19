@@ -112,11 +112,15 @@ report_telemetry() {
     return
   fi
 
-  # Anchor on the first failed sample, not on the end of the file. The host
-  # keeps running after the card dies, so tailing shows hours of identical
-  # failures while the samples that matter sit far above them.
+  # Anchor on the start of the most recent run of failures. Tailing is wrong
+  # because the host keeps logging for hours after the card dies, and the first
+  # failure is wrong because one file accumulates every crash the host has had.
   local boundary
-  boundary=$(grep -n -m1 'NVIDIA-SMI FAILED' "${TELEMETRY}" | cut -d: -f1)
+  boundary=$(awk '
+    /NVIDIA-SMI FAILED/ { if (!in_block) { start = NR; in_block = 1 } ; next }
+    { in_block = 0 }
+    END { if (start) print start }
+  ' "${TELEMETRY}")
 
   if [[ -z "${boundary}" ]]; then
     echo "(no failed sample recorded; showing the most recent instead)"
