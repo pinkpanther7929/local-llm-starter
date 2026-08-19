@@ -28,6 +28,9 @@ docker run --rm --gpus all nvidia/cuda:12.9.1-base-ubuntu24.04 nvidia-smi
 
 Host에서 `Xid 79`, `GPU has fallen off the bus`, `No devices were found`가 보이면 vLLM 튜닝보다 driver, PCIe, power, hardware 레벨 문제를 먼저 봐야 합니다.
 
+hang 이후에는 `scripts/gpu-watch.sh report`로 `Xid`와 직전 telemetry를 확인합니다.
+collector를 미리 걸어두는 방법은 [GPU Hang 증거 수집](operations.ko.md#gpu-hang-증거-수집)을 참고합니다.
+
 ## vLLM Memory
 
 CUDA OOM이나 startup instability가 있으면:

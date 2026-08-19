@@ -28,6 +28,10 @@ docker run --rm --gpus all nvidia/cuda:12.9.1-base-ubuntu24.04 nvidia-smi
 
 If the host reports `Xid 79`, `GPU has fallen off the bus`, or `No devices were found`, treat it as driver, PCIe, power, or hardware-level instability before tuning vLLM.
 
+Run `scripts/gpu-watch.sh report` to read the `Xid` and the telemetry from the
+hang. See [GPU Hang Evidence](operations.md#gpu-hang-evidence) to set up the
+collector before it happens again.
+
 ## vLLM Memory
 
 If startup fails with CUDA OOM or instability:
