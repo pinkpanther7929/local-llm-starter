@@ -37,11 +37,41 @@ collector를 미리 걸어두는 방법은 [GPU Hang 증거 수집](operations.k
 
 이 host에서는 카드가 0% utilization, 210MHz, 21W — 최저 전력 상태에서 버스에서 떨어졌습니다. CUDA kernel이 돌지 않았고, 선행하는 AER이나 `pcieport` 오류도 없었습니다. vLLM이 하는 어떤 일도 이런 고장을 만들 수 없습니다. 유휴 상태의 `Xid 79`는 PCIe link, 전력 상태 전환, 카드 전원 공급 쪽을 가리킵니다. host 레벨 변경을 **한 번에 하나씩** 적용하고 `gpu-watch`로 판정합니다.
 
-1. PCIe ASPM 비활성화. consumer board에서 유휴 중 버스 이탈의 가장 흔한 원인입니다. kernel command line에 `pcie_aspm=off pcie_port_pm=off`를 추가하고, firmware가 kernel 설정을 덮을 수 있으므로 BIOS에서도 ASPM을 끕니다.
-2. BIOS에서 Resizable BAR 비활성화.
-3. 카드가 최저 유휴 상태로 내려가지 않게 고정: `nvidia-smi -pm 1` 및 `nvidia-smi -lgc 510,2565`. 유휴 전력과 발열이 늘어나므로 위 두 BIOS 변경 이후에 시도합니다.
+후보 하나에 며칠 쓰기 전에 root port 자체의 capability를 먼저 확인합니다:
+
+```bash
+sudo lspci -vv -s 00:01.0 | grep -iE "LnkCap:|LnkSta:"
+sudo lspci -vv -s 01:00.0 | grep -iE "ASPM|LnkCtl:|LnkSta:"
+```
+
+이 host의 root port는 `ASPM not supported`를 보고합니다. 즉 GPU link에서 ASPM은 애초에 활성일 수 없었고, 끄는 것으로 달라지는 게 없습니다. root port는 `Width x8`도 보고하므로, 카드 쪽의 `x8 (downgraded)` 경고는 CPU lane 분기 결과이며 접점 불량이 아닙니다. 재장착으로는 아무것도 증명되지 않습니다.
+
+대신 같은 출력이 보여주는 것: link가 유휴 시 2.5GT/s로 내려갔다가 부하 시 16GT/s로 재트레이닝됩니다. 카드가 최저 전력 상태에서 죽었다는 사실과 합치면, **저전력 전환 자체**가 가장 유력한 후보입니다.
+
+1. 카드가 최저 유휴 상태로 내려가지 않게 고정합니다. P8 전력 상태와 유휴 link 다운시프트를 함께 억제합니다. crash로 재부팅되면 시험이 조용히 끝나버리므로 unit으로 설치합니다:
+
+   ```ini
+   # /etc/systemd/system/gpu-clocklock.service
+   [Unit]
+   Description=Keep the GPU out of its deepest idle power state
+   After=multi-user.target
+
+   [Service]
+   Type=oneshot
+   RemainAfterExit=yes
+   ExecStart=/usr/bin/nvidia-smi -pm 1
+   ExecStart=/usr/bin/nvidia-smi -lgc 510,2565
+   ExecStop=/usr/bin/nvidia-smi -rgc
+
+   [Install]
+   WantedBy=multi-user.target
+   ```
+
+   유휴 전력이 약 21W에서 40~60W로 오릅니다. 이것이 비용입니다.
+2. PCIe 전력 관리 비활성화: kernel command line에 `pcie_aspm=off pcie_port_pm=off`. PCI-PM L1 substate도 같이 끄므로 유지할 값은 있지만, root port에 ASPM이 없는 환경에서 큰 기대는 하지 않습니다.
+3. BIOS에서 Resizable BAR 비활성화.
 4. BIOS에서 PCIe link 속도를 Gen3로 제한.
-5. 카드와 전원 케이블 재장착, 12VHPWR connector 점검.
+5. 카드와 전원 케이블 재장착, 12VHPWR connector 점검. root port와 카드의 width가 실제로 불일치할 때만 의미가 있습니다.
 
 이 host의 MTBF는 42분에서 17시간까지 편차가 큽니다. 각 변경은 최소 48시간 관찰 후 판정합니다.
 
