@@ -48,7 +48,7 @@ sudo lspci -vv -s 01:00.0 | grep -iE "ASPM|LnkCtl:|LnkSta:"
 
 대신 같은 출력이 보여주는 것: link가 유휴 시 2.5GT/s로 내려갔다가 부하 시 16GT/s로 재트레이닝됩니다. 카드가 최저 전력 상태에서 죽었다는 사실과 합치면, **저전력 전환 자체**가 가장 유력한 후보입니다.
 
-1. 카드가 최저 유휴 상태로 내려가지 않게 고정합니다. P8 전력 상태와 유휴 link 다운시프트를 함께 억제합니다. **레버는 memory clock입니다.** graphics clock만 잠갔을 때는 SM 하한이 510MHz로 오른 것 외에 아무것도 바뀌지 않았습니다 — pstate는 P8, link는 2.5GT/s 그대로였습니다. memory clock을 잠그자 P2로 올라가고 link가 16GT/s로 유지됐습니다.
+1. **이 host에서 시험했고 실패했습니다.** 카드가 최저 유휴 상태로 내려가지 않게 고정합니다. P8 전력 상태와 유휴 link 다운시프트를 함께 억제합니다. 그럼에도 4시간 47분 뒤 44.7W / 510MHz / 0% utilization 상태에서 죽었습니다. lock이 실제로 걸려 있었음이 확인되므로 유휴 전력 상태는 원인이 아닙니다. 배제에 하루가 들고 레버가 직관적이지 않아 기록해 둡니다. **레버는 memory clock입니다.** graphics clock만 잠갔을 때는 SM 하한이 510MHz로 오른 것 외에 아무것도 바뀌지 않았습니다 — pstate는 P8, link는 2.5GT/s 그대로였습니다. memory clock을 잠그자 P2로 올라가고 link가 16GT/s로 유지됐습니다.
 
    `-lmc`는 지원되는 단계로 스냅되므로 최대값을 먼저 읽습니다:
 
@@ -91,6 +91,8 @@ sudo lspci -vv -s 01:00.0 | grep -iE "ASPM|LnkCtl:|LnkSta:"
 5. 카드와 전원 케이블 재장착, 12VHPWR connector 점검. root port와 카드의 width가 실제로 불일치할 때만 의미가 있습니다.
 
 이 host의 MTBF는 42분에서 17시간까지 편차가 큽니다. 각 변경은 최소 48시간 관찰 후 판정합니다.
+
+host 레벨 후보가 소진되면 backend를 완전히 내리고 `gpu-watch`만 남깁니다. 지금까지의 모든 hang은 0% utilization 상태에서, vLLM이 23.5 GiB를 점유한 채로 발생했습니다. bare idle은 남은 두 가설을 가릅니다 — CUDA context가 전혀 없는 상태에서도 죽으면 하드웨어 결함이고 RMA 대상입니다. 비어 있는 상태로 며칠 버티면 vLLM의 연산이 아니라 상주 할당 자체를 봐야 합니다.
 
 이 카드에서는 FlashInfer kernel이 GPU를 매달아 놓은 전례가 있습니다. sampler와 attention 두 경로 모두 확인합니다:
 
