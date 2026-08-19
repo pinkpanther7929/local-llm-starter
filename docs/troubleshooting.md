@@ -59,8 +59,12 @@ What the same output does show is that the link drops to 2.5 GT/s when idle and
 retrains to 16 GT/s under load. Combined with the card dying at its lowest power
 state, the low-power transitions themselves are the strongest candidate:
 
-1. Keep the card out of its deepest idle state, which suppresses both the P8
-   power state and the idle link downshift. The memory clock is the lever here.
+1. **Tested here and did not work.** Keep the card out of its deepest idle
+   state, which suppresses both the P8 power state and the idle link downshift.
+   The card still died 4h47m later at 44.7 W, 510 MHz and 0% utilization, so the
+   lock was demonstrably in force and the idle power state was not the cause.
+   Recorded because ruling it out costs a day and the lever is not obvious.
+   The memory clock is the lever here.
    Locking the graphics clock alone raised the SM floor to 510 MHz and changed
    nothing else: the card stayed in P8 and the link stayed at 2.5 GT/s. Locking
    the memory clock moved it to P2 and held the link at 16 GT/s.
@@ -112,6 +116,13 @@ state, the low-power transitions themselves are the strongest candidate:
 Mean time to failure here ranged from 42 minutes to 17 hours, so give each
 change at least 48 hours before crediting it.
 
+When the host-level candidates run out, stop the backend entirely and leave
+`gpu-watch` running. Every hang so far happened at 0% utilization with vLLM
+resident and holding 23.5 GiB, so bare idle separates the two remaining stories:
+a card that dies with no CUDA context at all is a hardware fault and belongs in
+an RMA, while one that survives days idle and empty points at the resident
+allocation rather than at anything vLLM computes.
+
 FlashInfer kernels have hung this card before, on both the sampler and the
 attention path. Check which backend was selected:
 
@@ -148,7 +159,7 @@ If port `3000` is already used, change:
 OPEN_WEBUI_PORT=3001
 ```
 
-## SearXNG Search
+## SearXNG Searchㅇ
 
 Check JSON output:
 
