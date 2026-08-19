@@ -38,6 +38,8 @@ docker compose --env-file profiles/vllm-qwen3-14b-awq-64k.env --profile vllm up 
 
 이 profile은 `KV_CACHE_DTYPE=fp8`, `VLLM_ALLOW_LONG_MAX_MODEL_LEN=1`, YaRN `HF_OVERRIDES`를 사용합니다. 모델 config의 기본 한계를 넘기는 실험 설정이므로 결과 품질과 안정성은 별도 확인이 필요합니다.
 
+fp8 KV cache는 attention backend 후보를 `FLASHINFER`와 `TRITON_ATTN`으로 좁힙니다. FlashInfer kernel은 이 카드를 PCIe bus에서 떨어뜨린 전력이 있어 profile이 `VLLM_ATTENTION_BACKEND=TRITON_ATTN`을 고정합니다. 그만큼 attention 처리량은 FlashInfer보다 낮습니다.
+
 ### Ollama
 
 `.env`를 수정합니다:
@@ -126,6 +128,7 @@ Max model length: 12288
 MAX_MODEL_LEN=65536
 GPU_MEMORY_UTILIZATION=0.95
 KV_CACHE_DTYPE=fp8
+VLLM_ATTENTION_BACKEND=TRITON_ATTN
 VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
 HF_OVERRIDES={"rope_scaling":{"rope_type":"yarn","factor":2.0,"original_max_position_embeddings":32768}}
 ```

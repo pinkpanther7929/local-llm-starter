@@ -32,6 +32,17 @@ Run `scripts/gpu-watch.sh report` to read the `Xid` and the telemetry from the
 hang. See [GPU Hang Evidence](operations.md#gpu-hang-evidence) to set up the
 collector before it happens again.
 
+FlashInfer kernels have hung this card before, on both the sampler and the
+attention path. Check which backend was selected:
+
+```bash
+docker logs vllm 2>&1 | grep -i "attention backend"
+```
+
+If it picked `FLASHINFER`, pin `VLLM_ATTENTION_BACKEND`. Note that
+`KV_CACHE_DTYPE=fp8` rules `FLASH_ATTN` out of the candidate list, so fp8
+profiles have to use `TRITON_ATTN`.
+
 ## vLLM Memory
 
 If startup fails with CUDA OOM or instability:

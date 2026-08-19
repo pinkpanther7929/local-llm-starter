@@ -31,6 +31,14 @@ Host에서 `Xid 79`, `GPU has fallen off the bus`, `No devices were found`가 �
 hang 이후에는 `scripts/gpu-watch.sh report`로 `Xid`와 직전 telemetry를 확인합니다.
 collector를 미리 걸어두는 방법은 [GPU Hang 증거 수집](operations.ko.md#gpu-hang-증거-수집)을 참고합니다.
 
+이 카드에서는 FlashInfer kernel이 GPU를 매달아 놓은 전례가 있습니다. sampler와 attention 두 경로 모두 확인합니다:
+
+```bash
+docker logs vllm 2>&1 | grep -i "attention backend"
+```
+
+`FLASHINFER`가 선택됐다면 `VLLM_ATTENTION_BACKEND`로 고정합니다. `KV_CACHE_DTYPE=fp8`은 `FLASH_ATTN`을 후보에서 제외하므로 fp8 profile에서는 `TRITON_ATTN`을 씁니다.
+
 ## vLLM Memory
 
 CUDA OOM이나 startup instability가 있으면:
