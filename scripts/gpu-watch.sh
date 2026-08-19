@@ -5,11 +5,15 @@ set -u
 
 LOG_DIR="${GPU_WATCH_LOG_DIR:-${XDG_STATE_HOME:-${HOME}/.local/state}/local-llm-starter}"
 TELEMETRY="${LOG_DIR}/gpu-telemetry.csv"
-INTERVAL="${GPU_WATCH_INTERVAL:-60}"
+# 15s, not 60s: the card died at idle 45s after its last sample, so a coarse
+# interval is all blind spot and no signal.
+INTERVAL="${GPU_WATCH_INTERVAL:-15}"
 CONTAINER="${GPU_WATCH_CONTAINER:-vllm}"
 
-QUERY="timestamp,temperature.gpu,power.draw,clocks.sm,memory.used,utilization.gpu,clocks_event_reasons.active"
-XID_PATTERN='Xid|fallen off the bus|NVRM:|GPU has fallen'
+QUERY="timestamp,temperature.gpu,power.draw,clocks.sm,memory.used,utilization.gpu,pstate,clocks_event_reasons.active"
+# AER and pcieport lines matter as much as Xid: a card that drops off the bus
+# while idle is a PCIe link story, not a CUDA one.
+XID_PATTERN='Xid|fallen off the bus|NVRM:|GPU has fallen|AER|pcieport|[Ll]ink is [Dd]own'
 
 usage() {
   cat >&2 <<EOF
@@ -88,6 +92,10 @@ report_journal() {
 Xid 79  = card dropped off the PCIe bus (power, PCIe link, thermal)
 Xid 13/31 = bad kernel or memory access from a CUDA kernel
 Xid 48  = uncorrectable VRAM error
+
+Check the utilization column on the samples before the gap. An Xid 79 while
+the card sat at 0% and its lowest clocks is a hardware, link, or power-state
+fault; no vLLM setting causes it.
 EOF
 }
 
