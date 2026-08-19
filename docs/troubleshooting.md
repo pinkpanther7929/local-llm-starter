@@ -39,9 +39,12 @@ attention path. Check which backend was selected:
 docker logs vllm 2>&1 | grep -i "attention backend"
 ```
 
-If it picked `FLASHINFER`, pin `VLLM_ATTENTION_BACKEND`. Note that
-`KV_CACHE_DTYPE=fp8` rules `FLASH_ATTN` out of the candidate list, so fp8
-profiles have to use `TRITON_ATTN`.
+If it picked `FLASHINFER`, pin `ATTENTION_BACKEND`, which is passed through as
+vLLM's `--attention-backend` flag. The `VLLM_ATTENTION_BACKEND` environment
+variable was removed in vLLM 0.23, so setting it does nothing.
+
+Note that `KV_CACHE_DTYPE=fp8` rules `FLASH_ATTN` out of the candidate list, so
+fp8 profiles have to use `TRITON_ATTN`.
 
 ## vLLM Memory
 

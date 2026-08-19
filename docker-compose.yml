@@ -33,11 +33,6 @@ services:
       # FlashInfer sampling kernels hang the GPU on Ada under sustained load,
       # which drops the card off the PCIe bus and needs a host reboot.
       VLLM_USE_FLASHINFER_SAMPLER: "${VLLM_USE_FLASHINFER_SAMPLER:-0}"
-
-      # Pinned so no profile can silently auto-select FlashInfer attention.
-      # fp8 KV cache rules FLASH_ATTN out, so those profiles set TRITON_ATTN.
-      VLLM_ATTENTION_BACKEND: "${VLLM_ATTENTION_BACKEND:-FLASH_ATTN}"
-
       VLLM_ALLOW_LONG_MAX_MODEL_LEN: "${VLLM_ALLOW_LONG_MAX_MODEL_LEN:-0}"
 
     command:
@@ -60,6 +55,11 @@ services:
 
       - --kv-cache-dtype
       - "${KV_CACHE_DTYPE:-auto}"
+
+      # Pinned so no profile silently auto-selects FlashInfer attention.
+      # fp8 KV cache rules FLASH_ATTN out, so those profiles set TRITON_ATTN.
+      - --attention-backend
+      - "${ATTENTION_BACKEND:-FLASH_ATTN}"
 
       - --generation-config
       - vllm
