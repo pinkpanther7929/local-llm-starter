@@ -48,7 +48,15 @@ sudo lspci -vv -s 01:00.0 | grep -iE "ASPM|LnkCtl:|LnkSta:"
 
 대신 같은 출력이 보여주는 것: link가 유휴 시 2.5GT/s로 내려갔다가 부하 시 16GT/s로 재트레이닝됩니다. 카드가 최저 전력 상태에서 죽었다는 사실과 합치면, **저전력 전환 자체**가 가장 유력한 후보입니다.
 
-1. 카드가 최저 유휴 상태로 내려가지 않게 고정합니다. P8 전력 상태와 유휴 link 다운시프트를 함께 억제합니다. crash로 재부팅되면 시험이 조용히 끝나버리므로 unit으로 설치합니다:
+1. 카드가 최저 유휴 상태로 내려가지 않게 고정합니다. P8 전력 상태와 유휴 link 다운시프트를 함께 억제합니다. **레버는 memory clock입니다.** graphics clock만 잠갔을 때는 SM 하한이 510MHz로 오른 것 외에 아무것도 바뀌지 않았습니다 — pstate는 P8, link는 2.5GT/s 그대로였습니다. memory clock을 잠그자 P2로 올라가고 link가 16GT/s로 유지됐습니다.
+
+   `-lmc`는 지원되는 단계로 스냅되므로 최대값을 먼저 읽습니다:
+
+   ```bash
+   nvidia-smi --query-gpu=clocks.max.mem --format=csv,noheader
+   ```
+
+   crash로 재부팅되면 lock이 풀려 시험이 조용히 끝나버리므로 unit으로 설치합니다:
 
    ```ini
    # /etc/systemd/system/gpu-clocklock.service
@@ -61,13 +69,22 @@ sudo lspci -vv -s 01:00.0 | grep -iE "ASPM|LnkCtl:|LnkSta:"
    RemainAfterExit=yes
    ExecStart=/usr/bin/nvidia-smi -pm 1
    ExecStart=/usr/bin/nvidia-smi -lgc 510,2565
+   ExecStart=/usr/bin/nvidia-smi -lmc 10501
    ExecStop=/usr/bin/nvidia-smi -rgc
+   ExecStop=/usr/bin/nvidia-smi -rmc
 
    [Install]
    WantedBy=multi-user.target
    ```
 
-   유휴 전력이 약 21W에서 40~60W로 오릅니다. 이것이 비용입니다.
+   service 상태만 보지 말고 세 지표를 모두 확인합니다:
+
+   ```bash
+   nvidia-smi --query-gpu=pstate,clocks.sm,clocks.mem,power.draw --format=csv,noheader
+   sudo lspci -vv -s 00:01.0 | grep "LnkSta:"
+   ```
+
+   유휴 전력이 약 21W에서 44W로 오릅니다. 이것이 비용입니다.
 2. PCIe 전력 관리 비활성화: kernel command line에 `pcie_aspm=off pcie_port_pm=off`. PCI-PM L1 substate도 같이 끄므로 유지할 값은 있지만, root port에 ASPM이 없는 환경에서 큰 기대는 하지 않습니다.
 3. BIOS에서 Resizable BAR 비활성화.
 4. BIOS에서 PCIe link 속도를 Gen3로 제한.
