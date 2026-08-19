@@ -37,7 +37,9 @@ collector를 미리 걸어두는 방법은 [GPU Hang 증거 수집](operations.k
 docker logs vllm 2>&1 | grep -i "attention backend"
 ```
 
-`FLASHINFER`가 선택됐다면 `VLLM_ATTENTION_BACKEND`로 고정합니다. `KV_CACHE_DTYPE=fp8`은 `FLASH_ATTN`을 후보에서 제외하므로 fp8 profile에서는 `TRITON_ATTN`을 씁니다.
+`FLASHINFER`가 선택됐다면 `ATTENTION_BACKEND`로 고정합니다. 이 값은 vLLM의 `--attention-backend` flag로 전달됩니다. vLLM 0.23에서 `VLLM_ATTENTION_BACKEND` 환경변수는 제거됐으므로 환경변수로는 고정되지 않습니다.
+
+`KV_CACHE_DTYPE=fp8`은 `FLASH_ATTN`을 후보에서 제외하므로 fp8 profile에서는 `TRITON_ATTN`을 씁니다.
 
 ## vLLM Memory
 
