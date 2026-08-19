@@ -81,3 +81,44 @@ Check the mount:
 ```bash
 docker exec local-llm-agent-gateway ls /knowledge
 ```
+
+## GPU Hang Evidence
+
+A card that falls off the PCIe bus takes `nvidia-smi` with it, so the state
+leading up to the hang has to be recorded before it happens.
+
+Enable a persistent journal once, so the kernel `Xid` survives the reboot:
+
+```bash
+sudo mkdir -p /var/log/journal && sudo systemctl restart systemd-journald
+```
+
+Then run the telemetry collector as a service:
+
+```ini
+# /etc/systemd/system/gpu-watch.service
+[Unit]
+Description=local-llm-starter GPU telemetry
+
+[Service]
+ExecStart=/opt/local-llm-starter/scripts/gpu-watch.sh watch
+Environment=GPU_WATCH_LOG_DIR=/var/log/local-llm-starter
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```bash
+sudo systemctl enable --now gpu-watch
+```
+
+After the next hang, read everything back in one command:
+
+```bash
+GPU_WATCH_LOG_DIR=/var/log/local-llm-starter scripts/gpu-watch.sh report
+```
+
+It prints the kernel `Xid` from this boot and the previous one, the last
+telemetry samples before the card disappeared, and the vLLM container's
+attention backend plus recent errors.

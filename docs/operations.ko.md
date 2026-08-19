@@ -81,3 +81,43 @@ mount 확인:
 ```bash
 docker exec local-llm-agent-gateway ls /knowledge
 ```
+
+## GPU Hang 증거 수집
+
+카드가 PCIe bus에서 떨어지면 `nvidia-smi`도 같이 죽기 때문에, hang 직전 상태는
+미리 기록해 두지 않으면 사후에 확인할 방법이 없습니다.
+
+kernel `Xid`가 reboot 후에도 남도록 persistent journal을 한 번 켭니다:
+
+```bash
+sudo mkdir -p /var/log/journal && sudo systemctl restart systemd-journald
+```
+
+telemetry collector는 service로 띄웁니다:
+
+```ini
+# /etc/systemd/system/gpu-watch.service
+[Unit]
+Description=local-llm-starter GPU telemetry
+
+[Service]
+ExecStart=/opt/local-llm-starter/scripts/gpu-watch.sh watch
+Environment=GPU_WATCH_LOG_DIR=/var/log/local-llm-starter
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```bash
+sudo systemctl enable --now gpu-watch
+```
+
+다음 hang 이후에는 한 번에 읽어옵니다:
+
+```bash
+GPU_WATCH_LOG_DIR=/var/log/local-llm-starter scripts/gpu-watch.sh report
+```
+
+이번 boot과 직전 boot의 kernel `Xid`, 카드가 사라지기 직전 telemetry sample,
+vLLM container의 attention backend와 최근 error를 함께 출력합니다.
