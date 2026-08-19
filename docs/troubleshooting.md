@@ -43,15 +43,51 @@ errors beforehand. Nothing vLLM does can cause that. An idle `Xid 79` points at
 the PCIe link, power-state transitions, or the card's power delivery, so change
 one host-level thing at a time and let `gpu-watch` judge it:
 
-1. Disable PCIe ASPM, the most common cause of an idle bus drop on consumer
-   boards. Add `pcie_aspm=off pcie_port_pm=off` to the kernel command line, and
-   disable ASPM in the BIOS too, since firmware can override the kernel.
-2. Disable Resizable BAR in the BIOS.
-3. Keep the card out of its deepest idle state: `nvidia-smi -pm 1` plus
-   `nvidia-smi -lgc 510,2565`. This costs idle power and heat, so prefer it
-   after the two BIOS-level changes.
+Check the root port's own capabilities before spending days on a candidate:
+
+```bash
+sudo lspci -vv -s 00:01.0 | grep -iE "LnkCap:|LnkSta:"
+sudo lspci -vv -s 01:00.0 | grep -iE "ASPM|LnkCtl:|LnkSta:"
+```
+
+On this host the root port reports `ASPM not supported`, which means ASPM was
+never active on the GPU link and disabling it changes nothing. The root port
+also reports `Width x8`, so the `x8 (downgraded)` warning on the card is CPU
+lane bifurcation, not a bad contact, and reseating the card would prove nothing.
+
+What the same output does show is that the link drops to 2.5 GT/s when idle and
+retrains to 16 GT/s under load. Combined with the card dying at its lowest power
+state, the low-power transitions themselves are the strongest candidate:
+
+1. Keep the card out of its deepest idle state, which suppresses both the P8
+   power state and the idle link downshift. Install it as a unit, because a
+   crash reboot would otherwise silently end the trial:
+
+   ```ini
+   # /etc/systemd/system/gpu-clocklock.service
+   [Unit]
+   Description=Keep the GPU out of its deepest idle power state
+   After=multi-user.target
+
+   [Service]
+   Type=oneshot
+   RemainAfterExit=yes
+   ExecStart=/usr/bin/nvidia-smi -pm 1
+   ExecStart=/usr/bin/nvidia-smi -lgc 510,2565
+   ExecStop=/usr/bin/nvidia-smi -rgc
+
+   [Install]
+   WantedBy=multi-user.target
+   ```
+
+   Idle draw rises from about 21 W to 40-60 W. That is the cost.
+2. Disable PCIe power management: `pcie_aspm=off pcie_port_pm=off` on the kernel
+   command line. Worth keeping since it also disables the PCI-PM L1 substates,
+   but do not expect much where the root port has no ASPM to begin with.
+3. Disable Resizable BAR in the BIOS.
 4. Cap the PCIe link speed to Gen3 in the BIOS.
-5. Reseat the card and its power cables, and check the 12VHPWR connector.
+5. Reseat the card and its power cables, and check the 12VHPWR connector. Only
+   worth doing if the root port and card widths actually disagree.
 
 Mean time to failure here ranged from 42 minutes to 17 hours, so give each
 change at least 48 hours before crediting it.
