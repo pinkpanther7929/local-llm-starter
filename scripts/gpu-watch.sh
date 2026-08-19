@@ -55,7 +55,12 @@ watch_gpu() {
   printf 'gpu-watch: sampling every %ss into %s\n' "${INTERVAL}" "${TELEMETRY}" >&2
 
   while :; do
-    if ! nvidia-smi --query-gpu="${QUERY}" --format=csv,noheader >>"${TELEMETRY}" 2>/dev/null; then
+    # Captured rather than redirected: a dead card makes nvidia-smi print
+    # "No devices were found" on stdout, which would litter the CSV.
+    if sample=$(nvidia-smi --query-gpu="${QUERY}" --format=csv,noheader 2>/dev/null) &&
+      [[ -n "${sample}" ]]; then
+      printf '%s\n' "${sample}" >>"${TELEMETRY}"
+    else
       # The card going missing is the single most useful line in this file.
       printf '%s, NVIDIA-SMI FAILED\n' "$(date -Is)" >>"${TELEMETRY}"
     fi
@@ -107,7 +112,20 @@ report_telemetry() {
     return
   fi
 
-  tail -n 15 "${TELEMETRY}"
+  # Anchor on the first failed sample, not on the end of the file. The host
+  # keeps running after the card dies, so tailing shows hours of identical
+  # failures while the samples that matter sit far above them.
+  local boundary
+  boundary=$(grep -n -m1 'NVIDIA-SMI FAILED' "${TELEMETRY}" | cut -d: -f1)
+
+  if [[ -z "${boundary}" ]]; then
+    echo "(no failed sample recorded; showing the most recent instead)"
+    tail -n 15 "${TELEMETRY}"
+    return
+  fi
+
+  local from=$((boundary > 12 ? boundary - 12 : 1))
+  sed -n "${from},$((boundary + 2))p" "${TELEMETRY}"
 }
 
 report_container() {
