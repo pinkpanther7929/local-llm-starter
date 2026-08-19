@@ -116,9 +116,14 @@ report_telemetry() {
   # because the host keeps logging for hours after the card dies, and the first
   # failure is wrong because one file accumulates every crash the host has had.
   local boundary
+  # A run is broken by a real sample, not by "not a failure marker". Older
+  # collectors let nvidia-smi's "No devices were found" reach the file, and
+  # matching on the marker alone made every such line start a fresh run, which
+  # anchored on the end of the outage instead of its start. Field count is the
+  # reliable test: samples carry every queried column, failures carry two.
   boundary=$(awk '
-    /NVIDIA-SMI FAILED/ { if (!in_block) { start = NR; in_block = 1 } ; next }
-    { in_block = 0 }
+    { if (split($0, f, ",") >= 6) in_block = 0
+      else if (!in_block) { start = NR; in_block = 1 } }
     END { if (start) print start }
   ' "${TELEMETRY}")
 
