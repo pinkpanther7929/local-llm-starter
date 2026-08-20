@@ -50,6 +50,14 @@ sudo lspci -vv -s 00:01.0 | grep -iE "LnkCap:|LnkSta:"
 sudo lspci -vv -s 01:00.0 | grep -iE "ASPM|LnkCtl:|LnkSta:"
 ```
 
+Context length is not the origin, however tempting it is to blame the profile
+that was in use when the hangs got noticed. The card dropping off the bus and
+needing a reboot was recorded on 2026-08-06, eight days before the 64K profile
+existed, while the default was 12288 with an `auto` KV cache. The only way the
+64K profile could still matter is the resident allocation it implies, since it
+raises utilization from 0.85 to 0.95, and that costs nothing to test by
+reverting the profile.
+
 On this host the root port reports `ASPM not supported`, which means ASPM was
 never active on the GPU link and disabling it changes nothing. The root port
 also reports `Width x8`, so the `x8 (downgraded)` warning on the card is CPU
