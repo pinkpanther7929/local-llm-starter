@@ -44,6 +44,8 @@ sudo lspci -vv -s 00:01.0 | grep -iE "LnkCap:|LnkSta:"
 sudo lspci -vv -s 01:00.0 | grep -iE "ASPM|LnkCtl:|LnkSta:"
 ```
 
+context length는 원인이 아닙니다. hang을 인지한 시점에 쓰고 있던 profile을 탓하기 쉽지만, 카드가 버스에서 떨어져 재부팅이 필요했던 사례는 2026-08-06에 이미 기록됐습니다. 64K profile이 생기기 8일 전이고, 당시 기본값은 12288 / `auto` KV cache였습니다. 64K profile이 그래도 관여할 수 있는 경로는 상주 할당량 하나뿐입니다 — utilization을 0.85에서 0.95로 올리기 때문입니다. profile을 되돌리는 것만으로 검증되므로 비용이 없습니다.
+
 이 host의 root port는 `ASPM not supported`를 보고합니다. 즉 GPU link에서 ASPM은 애초에 활성일 수 없었고, 끄는 것으로 달라지는 게 없습니다. root port는 `Width x8`도 보고하므로, 카드 쪽의 `x8 (downgraded)` 경고는 CPU lane 분기 결과이며 접점 불량이 아닙니다. 재장착으로는 아무것도 증명되지 않습니다.
 
 대신 같은 출력이 보여주는 것: link가 유휴 시 2.5GT/s로 내려갔다가 부하 시 16GT/s로 재트레이닝됩니다. 카드가 최저 전력 상태에서 죽었다는 사실과 합치면, **저전력 전환 자체**가 가장 유력한 후보입니다.
