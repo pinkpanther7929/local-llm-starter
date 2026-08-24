@@ -74,7 +74,7 @@ check_json_field() {
   local label="$1"
   local text="$2"
   local pattern="$3"
-  if printf '%s' "${text}" | grep -q "${pattern}"; then
+  if printf '%s' "${text}" | grep -qE "${pattern}"; then
     ok "${label}"
   else
     fail "${label}"
@@ -128,7 +128,12 @@ check_gateway() {
   local payload
   payload="$(json_payload)"
   if response="$(http_post_json "${base}/v1/chat/completions" "${payload}" 2>&1)"; then
-    check_json_field "agent gateway chat completion" "${response}" '"choices"'
+    # Non-empty content, not just the presence of "choices". A GPU that has
+    # fallen off the bus still returns a well-formed completion with an empty
+    # content, which passed this check for three hours on 2026-08-24. This is
+    # also the only check here that makes the GPU do work; /v1/models answers
+    # from the API server and stays 200 with a dead card.
+    check_json_field "agent gateway chat completion" "${response}" '"content": *"[^"]'
   else
     fail "agent gateway chat completion"
     printf '%s\n' "${response}" | head -40 | sed 's/^/[debug] /'

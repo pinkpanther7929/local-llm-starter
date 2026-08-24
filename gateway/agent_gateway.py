@@ -3,6 +3,7 @@ import json
 import os
 import re
 import socket
+import sys
 import time
 import urllib.error
 import urllib.parse
@@ -786,6 +787,25 @@ def append_tool_results(messages, response):
     return True
 
 
+class EmptyCompletionError(RuntimeError):
+    """Upstream answered, but with nothing in it."""
+
+
+def assert_non_empty(response):
+    # A GPU that has fallen off the bus keeps returning HTTP 200 with an empty
+    # completion instead of raising, so a dead card reads as a healthy one for
+    # as long as nobody looks at the text. On 2026-08-24 that gap was over three
+    # hours. An empty answer has to fail here or it fails nowhere.
+    for choice in response.get("choices") or []:
+        message = choice.get("message") or {}
+        if (message.get("content") or "").strip() or message.get("tool_calls"):
+            return
+    raise EmptyCompletionError(
+        "upstream returned an empty completion; check the GPU with nvidia-smi "
+        "and 'journalctl -k -b 0 | grep Xid' before retrying"
+    )
+
+
 def chat_completions(payload):
     agent_payload = with_gateway_tools(payload)
     agent_payload["stream"] = False
@@ -847,6 +867,7 @@ class Handler(BaseHTTPRequestHandler):
             payload = read_json_request(self)
             wants_stream = bool(payload.get("stream"))
             response = chat_completions(payload)
+            assert_non_empty(response)
             response.setdefault("agent_gateway", {})["latency_ms"] = now_ms() - started
             if wants_stream:
                 stream_chat_response(self, response)
@@ -856,7 +877,7 @@ class Handler(BaseHTTPRequestHandler):
             json_response(self, 400, {"error": "invalid json", "detail": str(exc)})
         except ValueError as exc:
             json_response(self, 400, {"error": str(exc)})
-        except (OSError, urllib.error.URLError) as exc:
+        except (EmptyCompletionError, OSError, urllib.error.URLError) as exc:
             json_response(self, 502, {"error": str(exc)})
 
 
@@ -866,5 +887,23 @@ def main():
     server.serve_forever()
 
 
+def selfcheck():
+    assert_non_empty({"choices": [{"message": {"content": "hi"}}]})
+    assert_non_empty({"choices": [{"message": {"content": "", "tool_calls": [{"id": "1"}]}}]})
+    for dead in ({"choices": [{"message": {"content": ""}}]},
+                 {"choices": [{"message": {"content": "   "}}]},
+                 {"choices": []},
+                 {}):
+        try:
+            assert_non_empty(dead)
+        except EmptyCompletionError:
+            continue
+        raise AssertionError("empty completion slipped through: {}".format(dead))
+    print("selfcheck ok")
+
+
 if __name__ == "__main__":
-    main()
+    if "--selfcheck" in sys.argv:
+        selfcheck()
+    else:
+        main()
