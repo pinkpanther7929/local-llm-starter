@@ -4,7 +4,8 @@
 FROM vllm/vllm-openai:v0.27.1
 
 # Qwen3.8's Gated DeltaNet path makes Triton compile a small CUDA helper at
-# startup. docker-compose.yml pins CC/CXX to gcc-14 for the RTX 4090 profiles.
+# startup. Use the base distribution's supported compiler rather than
+# assuming the image carries a particular GCC major version.
 RUN apt-get update \
- && apt-get install -y --no-install-recommends gcc-14 g++-14 \
+ && apt-get install -y --no-install-recommends build-essential \
  && rm -rf /var/lib/apt/lists/*
