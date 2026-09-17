@@ -10,6 +10,9 @@ fi
 if [ -n "${LOCAL_CPU_OFFLOAD_GB:-}" ]; then
   set -- "$@" --cpu-offload-gb "$LOCAL_CPU_OFFLOAD_GB"
 fi
+if [ "${LOCAL_LANGUAGE_MODEL_ONLY:-0}" = "1" ]; then
+  set -- "$@" --language-model-only
+fi
 if [ "${VLLM_ENFORCE_EAGER:-0}" = "1" ]; then
   # vLLM requires the model positional argument immediately after `serve`.
   set -- "$@" --enforce-eager
