@@ -9,3 +9,8 @@ FROM vllm/vllm-openai:v0.27.1
 RUN apt-get update \
  && apt-get install -y --no-install-recommends build-essential \
  && rm -rf /var/lib/apt/lists/*
+
+COPY scripts/vllm-entrypoint.sh /usr/local/bin/vllm-entrypoint
+RUN chmod 0755 /usr/local/bin/vllm-entrypoint
+
+ENTRYPOINT ["/usr/local/bin/vllm-entrypoint"]
