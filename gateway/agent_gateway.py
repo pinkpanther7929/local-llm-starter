@@ -215,6 +215,9 @@ def request_json(url, payload=None, timeout=HTTP_TIMEOUT_SECONDS):
                 text = response.read().decode("utf-8", errors="replace")
             return json.loads(text)
         except (ConnectionRefusedError, TimeoutError, urllib.error.URLError) as exc:
+            # Retrying an invalid chat template/request cannot repair it.
+            if isinstance(exc, urllib.error.HTTPError) and 400 <= exc.code < 500 and exc.code not in {408, 429}:
+                raise
             last_error = exc
             if attempt >= UPSTREAM_RETRIES:
                 break
@@ -806,12 +809,36 @@ def assert_non_empty(response):
     )
 
 
+def request_chat(payload):
+    # Qwen templates permit a single system message at the beginning.
+    # Keep conversation/tool ordering and preserve structured content parts.
+    systems = []
+    conversation = []
+    for message in payload.get("messages") or []:
+        if message.get("role") == "system":
+            systems.append(message.get("content") or "")
+        else:
+            conversation.append(message)
+    if systems:
+        if all(isinstance(content, str) for content in systems):
+            content = "\n\n".join(systems)
+        else:
+            content = []
+            for part in systems:
+                if content:
+                    content.append({"type": "text", "text": "\n\n"})
+                content.extend(part if isinstance(part, list) else [{"type": "text", "text": part}])
+        conversation.insert(0, {"role": "system", "content": content})
+    normalized = dict(payload, messages=conversation)
+    return request_json(UPSTREAM_BASE_URL + "/chat/completions", normalized)
+
+
 def chat_completions(payload):
     agent_payload = with_gateway_tools(payload)
     agent_payload["stream"] = False
     messages = agent_payload["messages"]
     for _ in range(MAX_TOOL_ROUNDS):
-        response = request_json(UPSTREAM_BASE_URL + "/chat/completions", agent_payload)
+        response = request_chat(agent_payload)
         if not append_tool_results(messages, response):
             return response
     agent_payload.pop("tools", None)
@@ -822,7 +849,7 @@ def chat_completions(payload):
             "content": "Tool round limit reached. Answer with the evidence already collected.",
         }
     )
-    return request_json(UPSTREAM_BASE_URL + "/chat/completions", agent_payload)
+    return request_chat(agent_payload)
 
 
 class Handler(BaseHTTPRequestHandler):
