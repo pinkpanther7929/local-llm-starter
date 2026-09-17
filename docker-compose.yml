@@ -39,6 +39,9 @@ services:
       # idle, so see docs/troubleshooting.md before trusting this as a fix.
       VLLM_USE_FLASHINFER_SAMPLER: "${VLLM_USE_FLASHINFER_SAMPLER:-0}"
       VLLM_ALLOW_LONG_MAX_MODEL_LEN: "${VLLM_ALLOW_LONG_MAX_MODEL_LEN:-0}"
+      # Used by the Qwen3.8 image entrypoint to add --enforce-eager on
+      # 24GB cards. Empty for the established Qwen3-14B image.
+      VLLM_ENFORCE_EAGER: "${VLLM_ENFORCE_EAGER:-}"
 
     command:
       - ${MODEL_ID:-Qwen/Qwen3-14B-AWQ}
