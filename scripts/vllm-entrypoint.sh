@@ -2,7 +2,8 @@
 set -eu
 
 if [ -n "${VLLM_ENFORCE_EAGER:-}" ]; then
-  exec vllm serve --enforce-eager "$@"
+  # vLLM requires the model positional argument immediately after `serve`.
+  exec vllm serve "$@" --enforce-eager
 fi
 
 exec vllm serve "$@"
