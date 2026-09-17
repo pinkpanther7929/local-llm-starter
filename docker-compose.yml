@@ -29,8 +29,10 @@ services:
 
       CUDA_HOME: /usr/local/cuda
 
-      CC: /usr/bin/gcc-14
-      CXX: /usr/bin/g++-14
+      # Older custom image uses gcc-14; Qwen3.8's official base uses the
+      # distro compiler selected by its profile.
+      CC: "${CC:-/usr/bin/gcc-14}"
+      CXX: "${CXX:-/usr/bin/g++-14}"
 
       # Suspected of hanging the GPU on Ada under sustained load. That finding
       # is now contested: the card has since dropped off the bus while fully
