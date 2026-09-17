@@ -42,6 +42,8 @@ services:
       # Used by the Qwen3.8 image entrypoint to add --enforce-eager on
       # 24GB cards. Empty for the established Qwen3-14B image.
       VLLM_ENFORCE_EAGER: "${VLLM_ENFORCE_EAGER:-}"
+      LOCAL_MAX_NUM_SEQS: "${LOCAL_MAX_NUM_SEQS:-}"
+      LOCAL_MAX_BATCHED_TOKENS: "${LOCAL_MAX_BATCHED_TOKENS:-}"
 
     command:
       - ${MODEL_ID:-Qwen/Qwen3-14B-AWQ}
@@ -114,7 +116,7 @@ services:
                 - gpu
 
   open-webui:
-    image: ghcr.io/open-webui/open-webui:main
+    image: ghcr.io/open-webui/open-webui:v0.11.3
 
     container_name: open-webui
     restart: unless-stopped
