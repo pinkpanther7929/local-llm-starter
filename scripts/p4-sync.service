@@ -1,0 +1,18 @@
+[Unit]
+Description=Fixed-workspace Perforce sync for local LLM
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/TS_BuildMachine-10.6.6.56_main
+EnvironmentFile=/etc/local-llm-p4-sync.env
+ExecStart=/usr/bin/python3 /opt/local-llm-starter/scripts/p4-sync-service.py
+Restart=on-failure
+RestartSec=5
+UMask=0077
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

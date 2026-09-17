@@ -1,5 +1,27 @@
 # 운영
 
+## 저장소 자동 검색 및 Perforce sync
+
+Qwen3.8 56K 프로필은 `/opt/TS_BuildMachine-10.6.6.56_main`을 `/knowledge`에
+읽기 전용 연결합니다. `저장소에서 CharacterMovement 구현 찾아줘`처럼 한글로
+요청하면 검색 전에 호스트 서비스가 자동 sync합니다. 질문당 한 번만 실행하며,
+sync 실패 시 파일 검색·읽기를 중단합니다. 일반 대화는 sync하지 않습니다.
+
+**최초 설정 필요:** [영문 문서의 설치 명령](operations.md#automatic-perforce-refresh-before-local-search)을
+따라 `/etc/local-llm-p4-sync.env`에 실제 P4 실행 파일·서버·사용자·클라이언트·티켓 경로를
+입력하고 `local-llm-p4-sync` 서비스를 등록하세요. 비밀번호·티켓 본문은 Git에 넣지 마세요.
+서비스는 현재 호스트 구성에 맞춰 root로 실행하며, 지정된 Unix 소켓만 사용합니다.
+
+워크스페이스 Root 일치, `noclobber noallwrite`, 열린 수정 파일 없음이 필요합니다.
+조건 불충족 시 설정을 임의로 바꾸지 않고 거부합니다. `sync -f`, revert, submit은
+실행하지 않습니다. 안전 동기화(`p4 sync -s`)도 뷰에 따라 파일 갱신·삭제를 할 수 있으므로,
+실제 빌드 작업과 공유 중이라면 전용 계정·워크스페이스를 권장합니다.
+
+서비스 등록 후 56K env로 **agent-gateway만** 재빌드·재생성하면 됩니다.
+`P4_SYNC_ENABLED=false`는 동기화만 끄고, `FILE_SEARCH_ENABLED=false`는 검색도 끕니다.
+검색은 인덱스 기반 RAG가 아니라 파일 탐색이며, 기본 256KiB 초과 파일과 Unreal 생성
+폴더(`Binaries`, `Intermediate`, `DerivedDataCache`, `Saved`)는 검색 대상에서 제외합니다.
+
 [English](operations.md) | Korean
 
 새 머신에서 repository를 clone한 뒤, 또는 profile과 port를 바꾼 뒤 이 스크립트로 상태를 확인합니다.
