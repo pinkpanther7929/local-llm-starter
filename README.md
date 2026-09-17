@@ -30,6 +30,25 @@ Or use the validated model profile directly:
 docker compose --env-file profiles/vllm-qwen3-14b-awq.env --profile vllm up -d --build
 ```
 
+### Qwen3.8-27B on RTX 4090 24GB (experimental)
+
+Qwen3.8-27B needs an INT4 checkpoint on a 24GB GPU. Its profiles use an
+isolated vLLM 0.27.1 / CUDA 13.0 image, leaving the established Qwen3-14B
+image untouched. Start at 32K, run the smoke test, then move to 64K:
+
+```bash
+docker compose --env-file profiles/vllm-qwen3.8-27b-awq-32k.env --profile vllm up -d --build
+scripts/smoke-test.sh --env-file profiles/vllm-qwen3.8-27b-awq-32k.env
+
+docker compose --env-file profiles/vllm-qwen3.8-27b-awq-64k.env --profile vllm up -d
+scripts/smoke-test.sh --env-file profiles/vllm-qwen3.8-27b-awq-64k.env
+```
+
+Both profiles use Qwen3.8's native context support--they do not apply YaRN.
+They pin Triton attention and disable FlashInfer sampling while the RTX 4090's
+previous PCIe stability issue remains under observation. The model checkpoint
+is community-produced AWQ, not an official Qwen quantization.
+
 ### Ollama
 
 Edit `.env`:

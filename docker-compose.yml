@@ -5,7 +5,9 @@ services:
 
     build:
       context: .
-      dockerfile: Dockerfile.vllm
+      # Profiles can select an isolated vLLM image when a newer model needs it.
+      # The default preserves the established Qwen3-14B-AWQ runtime.
+      dockerfile: ${VLLM_DOCKERFILE:-Dockerfile.vllm}
 
     container_name: vllm
     restart: unless-stopped
@@ -72,12 +74,12 @@ services:
       - "${HF_OVERRIDES:-{}}"
 
       - --reasoning-parser
-      - qwen3
+      - ${REASONING_PARSER:-qwen3}
 
       - --enable-auto-tool-choice
 
       - --tool-call-parser
-      - qwen3_coder
+      - ${TOOL_CALL_PARSER:-qwen3_coder}
 
   ollama:
     profiles:

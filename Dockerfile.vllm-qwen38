@@ -1,0 +1,4 @@
+# Keep the Qwen3.8 runtime isolated from Dockerfile.vllm, which remains the
+# known-good Qwen3-14B-AWQ / CUDA 12.9 stack.
+# vLLM 0.27.1 includes Qwen3.8 support and its matching CUDA 13.0 runtime.
+FROM vllm/vllm-openai:v0.27.1

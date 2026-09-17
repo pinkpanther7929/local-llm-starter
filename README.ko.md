@@ -64,6 +64,23 @@ docker compose --env-file profiles/ollama-qwen3.env --profile ollama up -d
 docker exec -it ollama ollama pull qwen3:8b
 ```
 
+## Qwen3.8-27B (RTX 4090 24GB, experimental)
+
+24GB GPU에는 INT4 checkpoint가 필요합니다. Qwen3.8 profile은 기존 Qwen3-14B image와
+분리된 vLLM 0.27.1 / CUDA 13.0 image를 사용합니다. 먼저 32K를 검증하고 64K로 올립니다:
+
+```bash
+docker compose --env-file profiles/vllm-qwen3.8-27b-awq-32k.env --profile vllm up -d --build
+scripts/smoke-test.sh --env-file profiles/vllm-qwen3.8-27b-awq-32k.env
+
+docker compose --env-file profiles/vllm-qwen3.8-27b-awq-64k.env --profile vllm up -d
+scripts/smoke-test.sh --env-file profiles/vllm-qwen3.8-27b-awq-64k.env
+```
+
+Qwen3.8 native context를 사용하므로 YaRN은 적용하지 않습니다. 이전 RTX 4090 PCIe
+안정성 이슈를 관찰하는 동안 Triton attention을 고정하고 FlashInfer sampler는 끕니다.
+checkpoint는 Qwen 공식 quantization이 아닌 community AWQ입니다.
+
 ## Endpoint
 
 ```text
