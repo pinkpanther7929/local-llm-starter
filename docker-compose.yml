@@ -162,6 +162,9 @@ services:
       FILE_SEARCH_ENABLED: ${FILE_SEARCH_ENABLED:-false}
       FILE_SEARCH_POLICY: ${FILE_SEARCH_POLICY:-keyword}
       FILE_SEARCH_PATHS: ${FILE_SEARCH_CONTAINER_PATH:-/knowledge}
+      P4_SYNC_ENABLED: "${P4_SYNC_ENABLED:-false}"
+      P4_SYNC_SOCKET: /p4-sync/sync.sock
+      P4_SYNC_TIMEOUT_SECONDS: "${P4_SYNC_TIMEOUT_SECONDS:-600}"
       MAX_TOOL_ROUNDS: ${MAX_TOOL_ROUNDS:-4}
       LLM_TIMEOUT_SECONDS: "${LLM_TIMEOUT_SECONDS:-600}"
       UPSTREAM_RETRIES: ${UPSTREAM_RETRIES:-6}
@@ -169,6 +172,7 @@ services:
 
     volumes:
       - ${FILE_SEARCH_HOST_PATH:-./knowledge}:${FILE_SEARCH_CONTAINER_PATH:-/knowledge}:ro
+      - ${P4_SYNC_HOST_DIR:-./runtime/p4-sync}:/p4-sync:ro
 
     depends_on:
       - searxng

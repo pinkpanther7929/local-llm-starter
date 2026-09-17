@@ -1,4 +1,5 @@
 import ipaddress
+import contextvars
 import json
 import os
 import re
@@ -36,6 +37,10 @@ FETCH_URL_ENABLED = os.environ.get("FETCH_URL_ENABLED", "true").lower() not in {
 MODEL_LIST_FALLBACK = os.environ.get("MODEL_LIST_FALLBACK", "true").lower() not in {"0", "false", "no"}
 FILE_SEARCH_ENABLED = os.environ.get("FILE_SEARCH_ENABLED", "false").lower() in {"1", "true", "yes"}
 FILE_SEARCH_POLICY = os.environ.get("FILE_SEARCH_POLICY", "keyword").lower()
+P4_SYNC_ENABLED = os.environ.get("P4_SYNC_ENABLED", "false").lower() in {"1", "true", "yes"}
+P4_SYNC_SOCKET = os.environ.get("P4_SYNC_SOCKET", "/p4-sync/sync.sock")
+P4_SYNC_TIMEOUT_SECONDS = int(os.environ.get("P4_SYNC_TIMEOUT_SECONDS", "600"))
+FILE_SYNC_STATE = contextvars.ContextVar("file_sync_state", default=None)
 FILE_SEARCH_RESULT_LIMIT = int(os.environ.get("FILE_SEARCH_RESULT_LIMIT", "5"))
 FILE_SEARCH_MAX_FILE_BYTES = int(os.environ.get("FILE_SEARCH_MAX_FILE_BYTES", "262144"))
 FILE_SEARCH_MAX_CHARS = int(os.environ.get("FILE_SEARCH_MAX_CHARS", "1200"))
@@ -74,6 +79,9 @@ if FILE_TOOLS_ENABLED:
     SYSTEM_TOOL_HINT += (
         " You can also use local read-only file tools when the user asks about configured local files, notes, or code. "
         "Use search_files to find evidence and read_file_excerpt to inspect a small line range."
+        " For Korean repository/code questions (저장소, 소스, 코드, 함수), use these tools too."
+        " Search concise identifiers or filenames, not a whole conversational sentence."
+        " If file tools or sync fail, report that failure; never claim the latest source was verified."
     )
 
 BLOCKED_HOSTS = {"localhost", "localhost.localdomain"}
@@ -309,7 +317,7 @@ def tool_fetch_url(arguments):
     return {"url": url, "content_type": content_type, "truncated": truncated, "text": text}
 
 
-SKIP_DIRS = {".git", ".hg", ".svn", "__pycache__", ".pytest_cache", ".venv", "node_modules", "dist", "build"}
+SKIP_DIRS = {".git", ".hg", ".svn", "__pycache__", ".pytest_cache", ".venv", "node_modules", "dist", "build", "Binaries", "Intermediate", "DerivedDataCache", "Saved"}
 
 
 def require_file_search_enabled():
@@ -317,6 +325,33 @@ def require_file_search_enabled():
         raise ValueError("Local file search is disabled.")
     if not FILE_SEARCH_PATHS:
         raise ValueError("FILE_SEARCH_PATHS is empty.")
+    ensure_repository_synced()
+
+
+def ensure_repository_synced():
+    if not P4_SYNC_ENABLED:
+        return
+    state = FILE_SYNC_STATE.get()
+    if state is not None and state.get("attempted"):
+        if state.get("error"):
+            raise ValueError(state["error"])
+        return
+    if state is not None:
+        state["attempted"] = True
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+            client.settimeout(P4_SYNC_TIMEOUT_SECONDS)
+            client.connect(P4_SYNC_SOCKET)
+            client.sendall(b"sync\n")
+            with client.makefile("rb") as response:
+                result = json.loads(response.readline(16384))
+        if not result.get("ok"):
+            raise ValueError(result.get("error") or "P4 sync failed")
+    except Exception as exc:
+        error = "Repository sync failed; source was not searched: {}".format(exc)
+        if state is not None:
+            state["error"] = error
+        raise ValueError(error) from exc
 
 
 def is_within_root(path, root):
@@ -631,6 +666,8 @@ def should_auto_search(text):
     if WEB_SEARCH_POLICY == "always":
         return True
     lowered = (text or "").lower()
+    if should_auto_file_search(text) and not any(word in lowered for word in ("웹", "인터넷", "web", "뉴스")):
+        return False
     if "local file" in lowered and "only" in lowered:
         return False
     if WEB_SEARCH_POLICY == "question" and ("?" in lowered or "what" in lowered or "how" in lowered or "why" in lowered):
@@ -728,6 +765,9 @@ def should_auto_file_search(text):
         "read ",
         "file path",
         "snippet",
+        "저장소", "퍼포스", "로컬 파일", "로컬파일", "소스", "코드",
+        "함수", "클래스", "구현", "파일에서", "파일을", "파일 내용",
+        "repository", "perforce", "source code",
     ]
     return any(trigger in lowered for trigger in triggers)
 
@@ -840,6 +880,14 @@ def request_chat(payload):
 
 
 def chat_completions(payload):
+    token = FILE_SYNC_STATE.set({})
+    try:
+        return _chat_completions(payload)
+    finally:
+        FILE_SYNC_STATE.reset(token)
+
+
+def _chat_completions(payload):
     agent_payload = with_gateway_tools(payload)
     agent_payload["stream"] = False
     messages = agent_payload["messages"]
