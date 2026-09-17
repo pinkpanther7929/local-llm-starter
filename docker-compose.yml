@@ -129,6 +129,9 @@ services:
     environment:
       OPENAI_API_BASE_URLS: http://agent-gateway:8010/v1
       OPENAI_API_KEY: ${OPENAI_API_KEY:-sk-local}
+      # Allow several gateway tool rounds; model-list checks stay short.
+      AIOHTTP_CLIENT_TIMEOUT: "${AIOHTTP_CLIENT_TIMEOUT:-3600}"
+      AIOHTTP_CLIENT_TIMEOUT_MODEL_LIST: "${AIOHTTP_CLIENT_TIMEOUT_MODEL_LIST:-10}"
       ENABLE_WEB_SEARCH: "true"
       WEB_SEARCH_ENGINE: searxng
       SEARXNG_QUERY_URL: http://searxng:8080/search?q=<query>&format=json
@@ -160,6 +163,7 @@ services:
       FILE_SEARCH_POLICY: ${FILE_SEARCH_POLICY:-keyword}
       FILE_SEARCH_PATHS: ${FILE_SEARCH_CONTAINER_PATH:-/knowledge}
       MAX_TOOL_ROUNDS: ${MAX_TOOL_ROUNDS:-4}
+      LLM_TIMEOUT_SECONDS: "${LLM_TIMEOUT_SECONDS:-600}"
       UPSTREAM_RETRIES: ${UPSTREAM_RETRIES:-6}
       UPSTREAM_RETRY_DELAY_SECONDS: ${UPSTREAM_RETRY_DELAY_SECONDS:-2}
 
