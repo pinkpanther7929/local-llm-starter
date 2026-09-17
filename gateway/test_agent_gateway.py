@@ -40,6 +40,36 @@ class ChatCompatibilityTests(unittest.TestCase):
         self.assertEqual(opener.open.call_count, 1)
         sleep.assert_not_called()
 
+    def test_chat_uses_long_timeout_without_retries(self):
+        with patch.object(gateway, "request_json", return_value={}) as request:
+            gateway.request_chat({"messages": []})
+        self.assertEqual(request.call_args.kwargs,
+                         {"timeout": gateway.LLM_TIMEOUT_SECONDS, "retries": 0})
+
+    def test_chat_timeout_is_not_retried(self):
+        for error in (TimeoutError("slow generation"),
+                      urllib.error.URLError(TimeoutError("slow generation"))):
+            with self.subTest(error=type(error).__name__):
+                opener = MagicMock()
+                opener.open.side_effect = error
+                with patch.object(gateway.urllib.request, "build_opener", return_value=opener), patch.object(gateway.time, "sleep") as sleep:
+                    with self.assertRaises(type(error)):
+                        gateway.request_chat({"messages": []})
+                self.assertEqual(opener.open.call_count, 1)
+                self.assertEqual(opener.open.call_args.kwargs["timeout"], gateway.LLM_TIMEOUT_SECONDS)
+                sleep.assert_not_called()
+
+    def test_non_chat_requests_keep_short_timeout_and_retries(self):
+        opener = MagicMock()
+        response = MagicMock()
+        response.__enter__.return_value.read.return_value = b'{"ok": true}'
+        opener.open.side_effect = [TimeoutError("temporary"), response]
+        with patch.object(gateway.urllib.request, "build_opener", return_value=opener), patch.object(gateway.time, "sleep") as sleep:
+            self.assertEqual(gateway.request_json("http://test/models"), {"ok": True})
+        self.assertEqual(opener.open.call_count, 2)
+        self.assertEqual(opener.open.call_args.kwargs["timeout"], gateway.HTTP_TIMEOUT_SECONDS)
+        sleep.assert_called_once()
+
 
 if __name__ == "__main__":
     unittest.main()

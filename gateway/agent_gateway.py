@@ -23,6 +23,7 @@ HOST = os.environ.get("GATEWAY_HOST", "0.0.0.0")
 PORT = int(os.environ.get("GATEWAY_PORT", "8010"))
 MAX_TOOL_ROUNDS = int(os.environ.get("MAX_TOOL_ROUNDS", "4"))
 HTTP_TIMEOUT_SECONDS = int(os.environ.get("HTTP_TIMEOUT_SECONDS", "20"))
+LLM_TIMEOUT_SECONDS = int(os.environ.get("LLM_TIMEOUT_SECONDS", "600"))
 UPSTREAM_RETRIES = int(os.environ.get("UPSTREAM_RETRIES", "6"))
 UPSTREAM_RETRY_DELAY_SECONDS = float(os.environ.get("UPSTREAM_RETRY_DELAY_SECONDS", "2"))
 FETCH_MAX_BYTES = int(os.environ.get("FETCH_MAX_BYTES", "1048576"))
@@ -194,9 +195,9 @@ def read_json_request(handler):
     return json.loads(raw or "{}")
 
 
-def request_json(url, payload=None, timeout=HTTP_TIMEOUT_SECONDS):
+def request_json(url, payload=None, timeout=HTTP_TIMEOUT_SECONDS, retries=UPSTREAM_RETRIES):
     last_error = None
-    for attempt in range(UPSTREAM_RETRIES + 1):
+    for attempt in range(retries + 1):
         if payload is None:
             data = None
             method = "GET"
@@ -219,7 +220,7 @@ def request_json(url, payload=None, timeout=HTTP_TIMEOUT_SECONDS):
             if isinstance(exc, urllib.error.HTTPError) and 400 <= exc.code < 500 and exc.code not in {408, 429}:
                 raise
             last_error = exc
-            if attempt >= UPSTREAM_RETRIES:
+            if attempt >= retries:
                 break
             time.sleep(UPSTREAM_RETRY_DELAY_SECONDS)
     raise last_error
@@ -830,7 +831,12 @@ def request_chat(payload):
                 content.extend(part if isinstance(part, list) else [{"type": "text", "text": part}])
         conversation.insert(0, {"role": "system", "content": content})
     normalized = dict(payload, messages=conversation)
-    return request_json(UPSTREAM_BASE_URL + "/chat/completions", normalized)
+    # Generation is not idempotent: a timed-out request may still be running.
+    # Wait for long prefills/completions without submitting duplicate work.
+    return request_json(
+        UPSTREAM_BASE_URL + "/chat/completions", normalized,
+        timeout=LLM_TIMEOUT_SECONDS, retries=0,
+    )
 
 
 def chat_completions(payload):
