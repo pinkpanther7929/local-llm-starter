@@ -2,3 +2,9 @@
 # known-good Qwen3-14B-AWQ / CUDA 12.9 stack.
 # vLLM 0.27.1 includes Qwen3.8 support and its matching CUDA 13.0 runtime.
 FROM vllm/vllm-openai:v0.27.1
+
+# Qwen3.8's Gated DeltaNet path makes Triton compile a small CUDA helper at
+# startup. docker-compose.yml pins CC/CXX to gcc-14 for the RTX 4090 profiles.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends gcc-14 g++-14 \
+ && rm -rf /var/lib/apt/lists/*
