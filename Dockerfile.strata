@@ -1,0 +1,13 @@
+FROM nvidia/cuda:13.0.0-base-ubuntu24.04
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends curl ca-certificates procps \
+ && rm -rf /var/lib/apt/lists/*
+
+ENV PATH="/root/.local/bin:${PATH}"
+
+COPY scripts/strata-entrypoint.sh /usr/local/bin/strata-entrypoint
+RUN chmod 0755 /usr/local/bin/strata-entrypoint
+
+ENTRYPOINT ["/usr/local/bin/strata-entrypoint"]
+

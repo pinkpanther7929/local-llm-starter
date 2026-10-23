@@ -60,6 +60,34 @@ Increase timeouts for cold model starts:
 SMOKE_CHAT_TIMEOUT=180 scripts/smoke-test.sh
 ```
 
+## Switching Backend Containers (Strata ↔ vLLM)
+
+Both `strata` and `vllm` bind host port `8000` and allocate GPU VRAM. Stop the active backend container (`--restart=no`) before copying the target profile to `.env` and starting the new backend. Model caches (`~/.cache/strata`, `~/.cache/huggingface`) persist on host volumes across switches.
+
+API endpoints (`:8000/v1`, `:8010/v1`) and request payloads (`chat_template_kwargs.enable_thinking=false`) remain identical; only the `model` ID (`qwen3.8-flash-next-iq3_s` vs `qwen3.8-27b`) changes when calling `:8000/v1` directly.
+
+### Switch from vLLM to Strata (128K MoE)
+
+```bash
+cd /opt/local-llm-starter
+docker update --restart=no vllm && docker stop vllm
+cp profiles/strata-qwen3.8-flash-next-128k.env .env
+docker update --restart=unless-stopped strata 2>/dev/null || true
+docker compose --profile strata up -d strata agent-gateway
+./scripts/smoke-test.sh
+```
+
+### Switch from Strata to vLLM (Qwen3.8-27B 56K)
+
+```bash
+cd /opt/local-llm-starter
+docker update --restart=no strata && docker stop strata
+cp profiles/vllm-qwen3.8-27b-awq-56k.env .env
+docker update --restart=unless-stopped vllm 2>/dev/null || true
+docker compose --profile vllm up -d vllm agent-gateway
+./scripts/smoke-test.sh
+```
+
 ## Large Local Folder Mounts
 
 For large source trees, keep the mount read-only and point the gateway at the host path:
@@ -84,8 +112,8 @@ docker exec local-llm-agent-gateway ls /knowledge
 
 ## Automatic Perforce refresh before local search
 
-The Qwen3.8 56K profile enables Korean/English local-source triggers and mounts
-`/srv/p4-workspace` read-only at `/knowledge`. A host service
+When local source search and Perforce sync are enabled, the gateway mounts a host
+workspace (for example `/srv/p4-workspace`) read-only at `/knowledge`. A host service
 syncs that fixed workspace before the first file tool in each chat request.
 No LLM-supplied shell commands, depot paths, force sync, revert, or submit are accepted.
 Sync failures block local reads for that request. Ordinary chat does not sync.

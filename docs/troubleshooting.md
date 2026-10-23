@@ -140,6 +140,7 @@ state, the low-power transitions themselves are the strongest candidate:
 5. Reseat the card and its power cables, and check the 12VHPWR connector. The
    original note here said this was only worth doing if the root port and card
    widths disagreed. That test was about contact on the PCIe lanes, and it does
+   
    not cover power delivery, which is where a 12VHPWR connector fails. With the
    bare-idle result in hand, inspect the connector regardless of link width.
 
@@ -202,6 +203,39 @@ variable was removed in vLLM 0.23, so setting it does nothing.
 
 Note that `KV_CACHE_DTYPE=fp8` rules `FLASH_ATTN` out of the candidate list, so
 fp8 profiles have to use `TRITON_ATTN`.
+
+### Driver/library version mismatch
+
+`nvidia-smi` printing `Failed to initialize NVML: Driver/library version
+mismatch` is a package problem, not the card. On 2026-09-11
+`unattended-upgrades` moved the user-space driver from 610.43.02 to 610.57.04
+while the kernel kept loading 610.43.02. A reboot did not fix it, because the
+module being loaded was Ubuntu's prebuilt `linux-modules-nvidia-610-<kernel>`
+package, which the archive had not rebuilt yet, and DKMS skipped the running
+kernel with `Original modules exist`.
+
+Check which module is actually loaded and where DKMS built:
+
+```bash
+cat /proc/driver/nvidia/version
+modinfo nvidia | grep -E '^(filename|version)'
+dkms status
+```
+
+`filename` under `/kernel/nvidia-610/` is the prebuilt package; under
+`/updates/dkms/` it is DKMS. The fix was to drop the prebuilt path and let DKMS
+own the module (Secure Boot is off on this host, so unsigned DKMS modules load):
+
+```bash
+sudo apt purge 'linux-modules-nvidia-*' 'linux-objects-nvidia-*' 'linux-signatures-nvidia-*'
+sudo apt install linux-headers-$(uname -r)   # triggers the DKMS build
+sudo modprobe nvidia nvidia_uvm && nvidia-smi
+```
+
+All `nvidia-*` and `libnvidia-*` packages are now on `apt-mark hold` together
+with the kernel and headers, so the driver only moves when someone unholds it.
+To upgrade on purpose: unhold the nvidia packages plus `linux-headers-*`,
+`apt upgrade`, reboot, hold again.
 
 ## vLLM Memory
 

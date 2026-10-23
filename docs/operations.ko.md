@@ -2,7 +2,7 @@
 
 ## 저장소 자동 검색 및 Perforce sync
 
-Qwen3.8 56K 프로필은 `/srv/p4-workspace`을 `/knowledge`에
+로컬 소스 검색 프로필은 호스트의 Perforce 워크스페이스를 `/knowledge`에
 읽기 전용 연결합니다. `저장소에서 CharacterMovement 구현 찾아줘`처럼 한글로
 요청하면 검색 전에 호스트 서비스가 자동 sync합니다. 질문당 한 번만 실행하며,
 sync 실패 시 파일 검색·읽기를 중단합니다. 일반 대화는 sync하지 않습니다.
@@ -80,6 +80,34 @@ cold start 시간이 길면 timeout을 늘립니다:
 
 ```bash
 SMOKE_CHAT_TIMEOUT=180 scripts/smoke-test.sh
+```
+
+## 백엔드 컨테이너 스위칭 (Strata ↔ vLLM)
+
+`strata`와 `vllm` 모두 호스트 `8000` 포트와 GPU(VRAM)를 점유합니다. 전환 시 기존 컨테이너를 먼저 중지(`--restart=no` 포함)한 뒤 목표 profile을 `.env`에 반영하고 기동합니다. 모델 캐시(`~/.cache/strata`, `~/.cache/huggingface`)는 호스트 볼륨에 유지되므로 재다운로드 없이 전환됩니다.
+
+API 엔드포인트(`:8000/v1`, `:8010/v1`)와 요청 포맷(`chat_template_kwargs.enable_thinking=false` 등)은 두 백엔드에서 100% 동일하며, 직접 `:8000/v1` 호출 시 `model` 이름만 활성 모델(`qwen3.8-flash-next-iq3_s` 또는 `qwen3.8-27b`)에 맞추면 됩니다(`:8010/v1` 게이트웨이는 `model` 생략 시 기본 모델로 자동 라우팅).
+
+### vLLM → Strata (128K MoE) 전환
+
+```bash
+cd /opt/local-llm-starter
+docker update --restart=no vllm && docker stop vllm
+cp profiles/strata-qwen3.8-flash-next-128k.env .env
+docker update --restart=unless-stopped strata 2>/dev/null || true
+docker compose --profile strata up -d strata agent-gateway
+./scripts/smoke-test.sh
+```
+
+### Strata → 기존 vLLM (Qwen3.8-27B 56K) 전환
+
+```bash
+cd /opt/local-llm-starter
+docker update --restart=no strata && docker stop strata
+cp profiles/vllm-qwen3.8-27b-awq-56k.env .env
+docker update --restart=unless-stopped vllm 2>/dev/null || true
+docker compose --profile vllm up -d vllm agent-gateway
+./scripts/smoke-test.sh
 ```
 
 ## 큰 local folder mount

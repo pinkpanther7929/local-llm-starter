@@ -1,4 +1,4 @@
-﻿# local-llm-starter
+# local-llm-starter
 
 English | [Korean](README.ko.md)
 
