@@ -6,7 +6,8 @@
 
 ## 도구
 
-- `search_files`: 설정된 local path에서 keyword search.
+- `list_files`: 설정된 local path(또는 하위 `path`)의 디렉터리 목록 조회 및 파일명 substring 탐색.
+- `search_files`: 설정된 local path(또는 하위 `path`, 예: `src`)에서 `ripgrep(rg)` 기반 고속 키워드 검색(프로젝트 경로 우선 가중치 및 한국어 조사/불용어 자동 제거).
 - `read_file_excerpt`: 검색된 파일의 작은 line range 읽기.
 
 기본값은 비활성화입니다.

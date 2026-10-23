@@ -3,7 +3,9 @@ import contextvars
 import json
 import os
 import re
+import shutil
 import socket
+import subprocess
 import sys
 import time
 import urllib.error
@@ -78,7 +80,7 @@ SYSTEM_TOOL_HINT = (
 if FILE_TOOLS_ENABLED:
     SYSTEM_TOOL_HINT += (
         " You can also use local read-only file tools when the user asks about configured local files, notes, or code. "
-        "Use search_files to find evidence and read_file_excerpt to inspect a small line range."
+        "Use list_files to inspect directories or find filenames, search_files to search file contents (optionally scoped by path such as 'src'), and read_file_excerpt to inspect a small line range."
         " For Korean repository/code questions (저장소, 소스, 코드, 함수), use these tools too."
         " Search concise identifiers or filenames, not a whole conversational sentence."
         " If file tools or sync fail, report that failure; never claim the latest source was verified."
@@ -317,7 +319,66 @@ def tool_fetch_url(arguments):
     return {"url": url, "content_type": content_type, "truncated": truncated, "text": text}
 
 
-SKIP_DIRS = {".git", ".hg", ".svn", "__pycache__", ".pytest_cache", ".venv", "node_modules", "dist", "build", "Binaries", "Intermediate", "DerivedDataCache", "Saved"}
+SKIP_DIRS = {".git", ".hg", ".svn", "__pycache__", ".pytest_cache", ".venv", "node_modules", "dist", "build", "Binaries", "Intermediate", "DerivedDataCache", "Saved", "SourceAssets", "ThirdParty"}
+DEFERRED_HEAVY_DIRS = {
+    item.strip().lower()
+    for item in os.environ.get(
+        "FILE_SEARCH_DEFERRED_DIRS",
+        "engine,vendor,third_party,thirdparty,external",
+    ).split(",")
+    if item.strip()
+}
+
+SEARCH_STOPWORDS = {
+    "a", "an", "and", "are", "as", "at", "be", "by", "code", "file", "files",
+    "find", "for", "from", "function", "class", "how", "in", "implementation",
+    "is", "it", "line", "lines", "local", "of", "on", "only", "or", "path",
+    "perforce", "read", "repo", "repository", "search", "show", "snippet",
+    "source", "the", "to", "what", "where", "with",
+    "검색", "검색해", "검색해줘", "관련", "구현", "내용", "대해", "대한",
+    "로컬", "로컬파일", "메서드", "무엇", "뭔지", "보여줘", "부분", "설명",
+    "설명해줘", "소스", "소스를", "소스코드", "어디", "어디에", "어떻게",
+    "알려", "알려줘", "있나", "있는", "있는지", "있어", "저장소", "찾아",
+    "찾아봐", "찾아줘", "코드", "코드를", "클래스", "파일", "파일내용",
+    "퍼포스", "함수", "해줘", "확인", "확인해", "확인해줘",
+}
+
+KOREAN_PARTICLES = (
+    "에서부터", "으로부터", "에서", "으로", "부터", "까지", "에게", "한테",
+    "이랑", "하고", "보다", "처럼", "마다", "조차", "마저", "이나", "이란",
+    "은", "는", "이", "가", "을", "를", "의", "에", "로", "도", "만", "과", "와",
+)
+
+
+def strip_korean_particle(token):
+    for particle in KOREAN_PARTICLES:
+        if token.endswith(particle) and len(token) - len(particle) >= 2:
+            return token[: -len(particle)]
+    return token
+
+
+def extract_search_terms(query):
+    raw_Text = (query or "").strip()
+    if not raw_Text:
+        return []
+    # Split ASCII identifiers/paths cleanly from adjacent Hangul syllables so
+    # "CharacterMovement에서" -> ["charactermovement", "에서"].
+    chunks = re.findall(r"[A-Za-z0-9_./:-]+|[가-힣]+", raw_Text)
+    cleaned = []
+    filtered = []
+    for chunk in chunks:
+        token = chunk.strip("._/:-").lower()
+        if not token:
+            continue
+        if re.match(r"^[가-힣]+$", token):
+            token = strip_korean_particle(token)
+        if len(token) < 2 and not token.isdigit():
+            continue
+        if token not in cleaned:
+            cleaned.append(token)
+        if token not in SEARCH_STOPWORDS and token not in KOREAN_PARTICLES and token not in filtered:
+            filtered.append(token)
+    return filtered or cleaned or [raw_Text.lower()]
 
 
 def require_file_search_enabled():
@@ -379,6 +440,26 @@ def resolve_allowed_file(path):
     raise ValueError("File is outside configured paths or does not exist.")
 
 
+def resolve_search_roots(subpath=None):
+    requested = str(subpath or "").strip()
+    if not requested:
+        return [root for root in FILE_SEARCH_PATHS if os.path.isdir(root)]
+    candidates = []
+    if os.path.isabs(requested):
+        candidates.append(os.path.realpath(requested))
+    else:
+        for root in FILE_SEARCH_PATHS:
+            candidates.append(os.path.realpath(os.path.join(root, requested)))
+    matched = [
+        candidate
+        for candidate in candidates
+        if any(is_within_root(candidate, root) for root in FILE_SEARCH_PATHS) and os.path.isdir(candidate)
+    ]
+    if not matched:
+        raise ValueError("Directory is outside configured paths or does not exist.")
+    return matched
+
+
 def relative_to_allowed_root(path):
     for root in FILE_SEARCH_PATHS:
         if is_within_root(path, root):
@@ -404,17 +485,137 @@ def read_text_file(path, max_bytes=FILE_SEARCH_MAX_FILE_BYTES):
     return raw[:max_bytes].decode("utf-8", errors="replace"), len(raw) > max_bytes
 
 
-def tool_search_files(arguments):
-    require_file_search_enabled()
-    query = str(arguments.get("query") or "").strip()
-    if not query:
-        raise ValueError("query is required")
-    limit = max(1, min(int(arguments.get("limit") or FILE_SEARCH_RESULT_LIMIT), FILE_SEARCH_RESULT_LIMIT))
-    terms = [term.lower() for term in re.findall(r"[\w./:-]+", query) if term.strip()]
-    if not terms:
-        terms = [query.lower()]
+def score_file_candidate(relative_path, terms, content_matched_terms=(), content_hits=0):
+    relative_lower = relative_path.lower()
+    filename_lower = os.path.basename(relative_lower)
+    stem_lower = os.path.splitext(filename_lower)[0]
+    matched_terms = set(content_matched_terms)
+    path_score = 0
+    for term in terms:
+        if term == stem_lower or term == filename_lower:
+            path_score += 80
+            matched_terms.add(term)
+        elif term in filename_lower:
+            path_score += 30
+            matched_terms.add(term)
+        elif term in relative_lower:
+            path_score += 8
+            matched_terms.add(term)
+    score = path_score + (len(matched_terms) * 25) + min(int(content_hits), 15) * 2
+    if score <= 0:
+        return 0
+    path_parts = [part for part in relative_lower.split("/") if part]
+    is_deferred_path = any(part in DEFERRED_HEAVY_DIRS for part in path_parts[:-1])
+    wants_deferred = any(term in DEFERRED_HEAVY_DIRS for term in terms)
+    if is_deferred_path and not wants_deferred:
+        score = max(1, int(score * 0.45))
+    return score
+
+
+def build_rg_globs():
+    globs = []
+    for skip in sorted(SKIP_DIRS):
+        globs.extend(["-g", "!{}/**".format(skip)])
+    for ext in sorted(FILE_SEARCH_EXTENSIONS):
+        globs.extend(["-g", "*{}".format(ext)])
+    return globs
+
+
+def search_files_with_rg(rg_bin, roots, terms):
+    globs = build_rg_globs()
+    max_size = str(FILE_SEARCH_MAX_FILE_BYTES)
+    candidates = {}
+
+    # 1. Fast filename/path pass via rg --files
+    files_cmd = [rg_bin, "--files", "--no-ignore", "--max-filesize", max_size] + globs + roots
+    proc_files = subprocess.run(files_cmd, capture_output=True, text=True, errors="replace", timeout=30)
+    for raw_line in proc_files.stdout.splitlines():
+        path = raw_line.strip()
+        if not path:
+            continue
+        rel = relative_to_allowed_root(path)
+        rel_lower = rel.lower()
+        if any(term in rel_lower for term in terms):
+            candidates[path] = {
+                "path": path,
+                "relative_path": rel,
+                "matched_terms": set(),
+                "hits": 0,
+                "snippets": [],
+            }
+
+    # 2. Fast content pass via rg --json -i -m 10
+    pattern = "|".join(re.escape(term) for term in terms if term)
+    if pattern:
+        match_cmd = [
+            rg_bin, "--json", "-i", "--no-ignore", "-m", "10",
+            "--max-filesize", max_size,
+        ] + globs + ["-e", pattern] + roots
+        proc_match = subprocess.run(match_cmd, capture_output=True, text=True, errors="replace", timeout=60)
+        for raw_line in proc_match.stdout.splitlines():
+            if not raw_line.startswith("{"):
+                continue
+            try:
+                event = json.loads(raw_line)
+            except json.JSONDecodeError:
+                continue
+            if event.get("type") != "match":
+                continue
+            data = event.get("data") or {}
+            path = (data.get("path") or {}).get("text")
+            line_text = ((data.get("lines") or {}).get("text") or "").rstrip("\r\n")
+            line_no = int(data.get("line_number") or 0)
+            if not path:
+                continue
+            entry = candidates.get(path)
+            if entry is None:
+                entry = {
+                    "path": path,
+                    "relative_path": relative_to_allowed_root(path),
+                    "matched_terms": set(),
+                    "hits": 0,
+                    "snippets": [],
+                }
+                candidates[path] = entry
+            entry["hits"] += 1
+            line_lower = line_text.lower()
+            for term in terms:
+                if term in line_lower:
+                    entry["matched_terms"].add(term)
+            if len(entry["snippets"]) < 3:
+                entry["snippets"].append(
+                    {
+                        "line": line_no,
+                        "text": line_text.strip()[:FILE_SEARCH_MAX_CHARS],
+                    }
+                )
+
     results = []
-    for root in FILE_SEARCH_PATHS:
+    for path, entry in candidates.items():
+        score = score_file_candidate(
+            entry["relative_path"],
+            terms,
+            entry["matched_terms"],
+            entry["hits"],
+        )
+        if score <= 0:
+            continue
+        snippets = entry["snippets"] or [{"line": 0, "text": "Path match"}]
+        results.append(
+            {
+                "path": path,
+                "relative_path": entry["relative_path"],
+                "score": score,
+                "truncated": False,
+                "snippets": snippets,
+            }
+        )
+    return results
+
+
+def search_files_with_walk(roots, terms):
+    results = []
+    for root in roots:
         if not os.path.isdir(root):
             continue
         for current_root, dirnames, filenames in os.walk(root):
@@ -424,14 +625,14 @@ def tool_search_files(arguments):
                 if not is_searchable_file(path):
                     continue
                 relative_path = relative_to_allowed_root(path)
-                relative_lower = relative_path.lower()
-                path_score = sum(3 for term in terms if term in relative_lower)
                 try:
                     text, truncated = read_text_file(path)
                 except (OSError, ValueError):
                     continue
                 lowered = text.lower()
-                score = path_score + sum(lowered.count(term) for term in terms)
+                matched_terms = {term for term in terms if term in lowered}
+                hits = sum(min(lowered.count(term), 10) for term in matched_terms)
+                score = score_file_candidate(relative_path, terms, matched_terms, hits)
                 if score <= 0:
                     continue
                 snippets = []
@@ -446,7 +647,7 @@ def tool_search_files(arguments):
                         )
                     if len(snippets) >= 3:
                         break
-                if not snippets and path_score:
+                if not snippets:
                     snippets.append({"line": 0, "text": "Path match"})
                 results.append(
                     {
@@ -457,12 +658,149 @@ def tool_search_files(arguments):
                         "snippets": snippets,
                     }
                 )
-    results.sort(key=lambda item: item["score"], reverse=True)
+    return results
+
+
+def split_primary_and_deferred_roots(roots):
+    primary = []
+    deferred = []
+    for root in roots:
+        if not os.path.isdir(root):
+            continue
+        try:
+            children = sorted(os.listdir(root))
+        except OSError:
+            primary.append(root)
+            continue
+        has_deferred = any(
+            name.lower() in DEFERRED_HEAVY_DIRS and os.path.isdir(os.path.join(root, name))
+            for name in children
+        )
+        if not has_deferred:
+            primary.append(root)
+            continue
+        for name in children:
+            if name in SKIP_DIRS:
+                continue
+            full = os.path.join(root, name)
+            if name.lower() in DEFERRED_HEAVY_DIRS and os.path.isdir(full):
+                deferred.append(full)
+            else:
+                primary.append(full)
+    return primary, deferred
+
+
+def run_search_backend(roots, terms):
+    if not roots:
+        return []
+    rg_bin = shutil.which("rg")
+    if rg_bin:
+        try:
+            return search_files_with_rg(rg_bin, roots, terms)
+        except Exception:
+            pass
+    return search_files_with_walk(roots, terms)
+
+
+def tool_search_files(arguments):
+    require_file_search_enabled()
+    query = str(arguments.get("query") or "").strip()
+    if not query:
+        raise ValueError("query is required")
+    limit = max(1, min(int(arguments.get("limit") or FILE_SEARCH_RESULT_LIMIT), FILE_SEARCH_RESULT_LIMIT))
+    explicit_path = str(arguments.get("path") or "").strip()
+    roots = resolve_search_roots(explicit_path)
+    terms = extract_search_terms(query)
+    wants_heavy = bool(explicit_path) or any(term in DEFERRED_HEAVY_DIRS for term in terms)
+    if wants_heavy:
+        results = run_search_backend(roots, terms)
+    else:
+        primary_roots, deferred_roots = split_primary_and_deferred_roots(roots)
+        results = run_search_backend(primary_roots, terms)
+        if len(results) < limit and deferred_roots:
+            results.extend(run_search_backend(deferred_roots, terms))
+    results.sort(key=lambda item: (item["score"], -len(item["relative_path"])), reverse=True)
     return {
         "query": query,
-        "roots": FILE_SEARCH_PATHS,
+        "terms": terms,
+        "roots": roots,
         "results": results[:limit],
     }
+
+
+def tool_list_files(arguments):
+    require_file_search_enabled()
+    explicit_path = str(arguments.get("path") or "").strip()
+    roots = resolve_search_roots(explicit_path)
+    pattern = str(arguments.get("pattern") or "").strip().lower()
+    limit = max(1, min(int(arguments.get("limit") or 30), 100))
+    entries = []
+    if not pattern:
+        # List immediate children of the requested directory/roots
+        for root in roots:
+            try:
+                names = sorted(os.listdir(root))
+            except OSError:
+                continue
+            for name in names:
+                if name in SKIP_DIRS:
+                    continue
+                full = os.path.join(root, name)
+                rel = relative_to_allowed_root(full)
+                entries.append(
+                    {
+                        "path": rel + ("/" if os.path.isdir(full) else ""),
+                        "type": "dir" if os.path.isdir(full) else "file",
+                    }
+                )
+                if len(entries) >= limit:
+                    break
+        return {"roots": roots, "pattern": pattern, "entries": entries[:limit]}
+
+    rg_bin = shutil.which("rg")
+    if rg_bin and roots:
+        globs = build_rg_globs()
+        wants_heavy = bool(explicit_path) or any(heavy in pattern for heavy in DEFERRED_HEAVY_DIRS)
+        search_batches = [roots] if wants_heavy else list(split_primary_and_deferred_roots(roots))
+        matched = []
+        for batch in search_batches:
+            if not batch:
+                continue
+            cmd = [rg_bin, "--files", "--no-ignore"] + globs + batch
+            proc = subprocess.run(cmd, capture_output=True, text=True, errors="replace", timeout=30)
+            for raw_line in proc.stdout.splitlines():
+                full = raw_line.strip()
+                if not full:
+                    continue
+                rel = relative_to_allowed_root(full)
+                if pattern in rel.lower():
+                    matched.append(rel)
+            if len(matched) >= limit:
+                break
+        matched.sort(
+            key=lambda rel: (
+                any(part in DEFERRED_HEAVY_DIRS for part in rel.lower().split("/")[:-1]),
+                len(rel),
+                rel,
+            )
+        )
+        return {
+            "roots": roots,
+            "pattern": pattern,
+            "entries": [{"path": rel, "type": "file"} for rel in matched[:limit]],
+        }
+
+    for root in roots:
+        for current_root, dirnames, filenames in os.walk(root):
+            dirnames[:] = [name for name in dirnames if name not in SKIP_DIRS]
+            for filename in filenames:
+                full = os.path.join(current_root, filename)
+                rel = relative_to_allowed_root(full)
+                if pattern in rel.lower():
+                    entries.append({"path": rel, "type": "file"})
+                    if len(entries) >= limit:
+                        return {"roots": roots, "pattern": pattern, "entries": entries}
+    return {"roots": roots, "pattern": pattern, "entries": entries}
 
 
 def tool_read_file_excerpt(arguments):
@@ -534,12 +872,28 @@ if FILE_TOOLS_ENABLED:
             {
                 "type": "function",
                 "function": {
+                    "name": "list_files",
+                    "description": "List directories or find files by filename substring under configured local read-only file paths.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "path": {"type": "string", "description": "Optional subdirectory relative to a configured root (e.g. 'src/core')."},
+                            "pattern": {"type": "string", "description": "Optional filename/path substring filter."},
+                            "limit": {"type": "integer", "description": "Maximum result count."},
+                        },
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
                     "name": "search_files",
                     "description": "Search configured local read-only file paths and return matching files with short line snippets.",
                     "parameters": {
                         "type": "object",
                         "properties": {
-                            "query": {"type": "string", "description": "Keyword query."},
+                            "query": {"type": "string", "description": "Concise identifier, symbol, or keyword query."},
+                            "path": {"type": "string", "description": "Optional subdirectory relative to a configured root (e.g. 'src')."},
                             "limit": {"type": "integer", "description": "Maximum result count."},
                         },
                         "required": ["query"],
@@ -566,6 +920,7 @@ if FILE_TOOLS_ENABLED:
     )
     TOOL_HANDLERS.update(
         {
+            "list_files": tool_list_files,
             "search_files": tool_search_files,
             "read_file_excerpt": tool_read_file_excerpt,
         }
@@ -628,15 +983,23 @@ def run_tool_call(tool_call):
     return handler(arguments)
 
 
+def is_meta_task_prompt(text):
+    stripped = (text or "").lstrip()
+    return stripped.startswith("### Task:")
+
+
 def with_gateway_tools(payload):
     payload = dict(payload)
     payload.setdefault("model", DEFAULT_MODEL)
     payload["stream"] = False
+    payload.setdefault("chat_template_kwargs", {"enable_thinking": False})
+    messages = list(payload.get("messages") or [])
+    if is_meta_task_prompt(last_user_text(messages)):
+        payload["messages"] = messages
+        return payload
     client_tools = payload.get("tools") or []
     payload["tools"] = TOOLS + [tool for tool in client_tools if tool.get("type") == "function"]
     payload.setdefault("tool_choice", "auto")
-    payload.setdefault("chat_template_kwargs", {"enable_thinking": False})
-    messages = list(payload.get("messages") or [])
     messages.insert(0, {"role": "system", "content": SYSTEM_TOOL_HINT})
     add_auto_file_context(messages)
     add_auto_search_context(messages)
@@ -661,6 +1024,8 @@ def last_user_text(messages):
 
 
 def should_auto_search(text):
+    if is_meta_task_prompt(text):
+        return False
     if WEB_SEARCH_POLICY == "off":
         return False
     if WEB_SEARCH_POLICY == "always":
@@ -750,6 +1115,8 @@ def extract_local_file_paths(text):
 
 
 def should_auto_file_search(text):
+    if is_meta_task_prompt(text):
+        return False
     if not FILE_TOOLS_ENABLED:
         return False
     if FILE_SEARCH_POLICY == "always":

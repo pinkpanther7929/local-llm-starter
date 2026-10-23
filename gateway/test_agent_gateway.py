@@ -113,6 +113,34 @@ class RepositoryTests(unittest.TestCase):
         finally:
             gateway.FILE_SYNC_STATE.reset(state)
 
+    def test_extract_search_terms_strips_particles_and_stopwords(self):
+        terms = gateway.extract_search_terms("저장소에서 CharacterMovement에서 이동 구현 찾아줘")
+        self.assertEqual(terms, ["charactermovement", "이동"])
+
+    def test_score_deprioritizes_deferred_dirs_unless_requested(self):
+        project_score = gateway.score_file_candidate(
+            "src/character/CharacterMovementComponent.cpp",
+            ["charactermovement"],
+            {"charactermovement"},
+            10,
+        )
+        vendor_score = gateway.score_file_candidate(
+            "vendor/runtime/Private/CharacterMovementComponentAsync.cpp",
+            ["charactermovement"],
+            {"charactermovement"},
+            10,
+        )
+        self.assertGreater(project_score, vendor_score)
+
+    def test_meta_task_prompt_skips_auto_search_and_tools(self):
+        meta = "### Task:\nGenerate a concise, 3-5 word title for: 저장소에서 CharacterMovement 구현 찾아줘"
+        with patch.object(gateway, "FILE_TOOLS_ENABLED", True), patch.object(gateway, "FILE_SEARCH_POLICY", "keyword"), patch.object(gateway, "WEB_SEARCH_POLICY", "keyword"):
+            self.assertFalse(gateway.should_auto_file_search(meta))
+            self.assertFalse(gateway.should_auto_search(meta))
+            payload = gateway.with_gateway_tools({"messages": [{"role": "user", "content": meta}]})
+            self.assertNotIn("tools", payload)
+            self.assertEqual(len(payload["messages"]), 1)
+
 
 if __name__ == "__main__":
     unittest.main()

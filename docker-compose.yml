@@ -90,6 +90,50 @@ services:
       - --tool-call-parser
       - ${TOOL_CALL_PARSER:-qwen3_coder}
 
+  strata:
+    profiles:
+      - strata
+
+    build:
+      context: .
+      dockerfile: Dockerfile.strata
+
+    container_name: strata
+    restart: unless-stopped
+
+    runtime: nvidia
+    ipc: host
+    shm_size: "16gb"
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+
+    ports:
+      - "${STRATA_PORT:-8000}:8000"
+
+    volumes:
+      - ~/.cache/strata:/root/.local/share/strata
+
+    environment:
+      STRATA_INTERNAL_PORT: "8000"
+      STRATA_ALLOWED_HOSTS: "${STRATA_ALLOWED_HOSTS:-strata,strata:8000,localhost,localhost:8000,127.0.0.1,127.0.0.1:8000}"
+
+    command:
+      - --model
+      - ${STRATA_MODEL:-iq3_s}
+      - --context
+      - ${STRATA_CONTEXT:-128k}
+      - --vision
+      - ${STRATA_VISION:-gpu}
+      - --tune
+      - ${STRATA_TUNE:-skip}
+      - --access
+      - lan
+      - --no-api-key
+      - --port
+      - "8000"
+
   ollama:
     profiles:
       - ollama
@@ -162,6 +206,7 @@ services:
       FILE_SEARCH_ENABLED: ${FILE_SEARCH_ENABLED:-false}
       FILE_SEARCH_POLICY: ${FILE_SEARCH_POLICY:-keyword}
       FILE_SEARCH_PATHS: ${FILE_SEARCH_CONTAINER_PATH:-/knowledge}
+      FILE_SEARCH_DEFERRED_DIRS: ${FILE_SEARCH_DEFERRED_DIRS:-engine,vendor,third_party,thirdparty,external}
       P4_SYNC_ENABLED: "${P4_SYNC_ENABLED:-false}"
       P4_SYNC_SOCKET: /p4-sync/sync.sock
       P4_SYNC_TIMEOUT_SECONDS: "${P4_SYNC_TIMEOUT_SECONDS:-600}"

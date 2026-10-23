@@ -6,7 +6,8 @@ Use read-only local file tools from `agent-gateway` to search configured folders
 
 ## Tools
 
-- `search_files`: keyword search over configured local paths.
+- `list_files`: list directories or find files by filename substring under configured local paths (or a relative `path`).
+- `search_files`: fast `ripgrep (rg)` keyword search over configured local paths (with optional relative `path` filter, Korean particle/stopword stripping, and project-directory priority over vendor/engine folders).
 - `read_file_excerpt`: reads a small line range from one matched file.
 
 The tools are disabled by default.
