@@ -70,3 +70,27 @@ hermes chat -q "Say OK only."
 - **단일 쿼리 실행**: `hermes chat -q "명령 내용"`
 - **세션 이어하기**: `hermes -c` 또는 `hermes --resume latest`
 
+---
+
+## 6. 비상 중지 및 제어 (Emergency Stop)
+
+에이전트가 루프에 빠지거나 너무 느려졌을 때 즉시 중지하는 방법입니다.
+
+### 1) 실행 중 실시간 중단
+- `Ctrl + C` 1회: 현재 도구 실행 및 추론 즉시 취소 (인터럽트).
+- `Ctrl + C` 2회: Hermes 프로세스 완전 종료.
+
+### 2) 비상 정지 명령어
+```bash
+# 모든 백그라운드 턴/스케줄러 즉시 일시정지
+hermes pause
+
+# 일시정지 해제 및 재개
+hermes resume
+```
+
+### 3) 프로세스 강제 종료
+- **Linux**: `pkill -9 -f hermes`
+- **Windows**: `taskkill /F /IM hermes.exe`
+
+

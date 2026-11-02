@@ -59,3 +59,27 @@ hermes chat -q "Say OK only."
 - **Single Query**: Run `hermes chat -q "query"`
 - **Resume Session**: Run `hermes -c` or `hermes --resume latest`
 
+---
+
+## 6. Emergency Stop & Control
+
+If the agent gets stuck in a loop or takes too long:
+
+### 1) Interactive Interrupt
+- `Ctrl + C` (1x): Interrupts the current tool execution or generation turn.
+- `Ctrl + C` (2x): Exits the Hermes process.
+
+### 2) Emergency Stop Commands
+```bash
+# Emergency pause all turns, kanban dispatch, and background cron jobs
+hermes pause
+
+# Resume after pausing
+hermes resume
+```
+
+### 3) Process Kill
+- **Linux**: `pkill -9 -f hermes`
+- **Windows**: `taskkill /F /IM hermes.exe`
+
+
