@@ -139,6 +139,7 @@ Max model length: 12288
 
 - [Model Guide](docs/model-guide.md)
 - [Operations](docs/operations.md)
+- [Hermes Agent Integration](docs/hermes-agent.md)
 - [Personal Knowledge Tools](docs/personal-knowledge.md)
 - [Troubleshooting](docs/troubleshooting.md)
 

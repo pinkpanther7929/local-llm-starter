@@ -168,6 +168,7 @@ vLLM 실행 옵션에는 `--generation-config vllm`을 넣어 모델의 `generat
 
 - [모델 가이드](docs/model-guide.ko.md)
 - [운영](docs/operations.ko.md)
+- [Hermes Agent 연동](docs/hermes-agent.ko.md)
 - [개인 지식 도구](docs/personal-knowledge.ko.md)
 - [문제 해결](docs/troubleshooting.ko.md)
 
