@@ -99,8 +99,8 @@ Backend OpenAI-compatible API:
   vLLM: http://localhost:8000/v1
   Ollama: http://localhost:11434/v1
   Strata: http://localhost:8000/v1
-LLM scheduler (Strata profile, 시험 포트): http://localhost:8020/v1
-  상태: http://localhost:8020/v1/scheduler/status
+LLM scheduler (Strata profile, 8000의 유일한 입구): http://localhost:8000/v1
+  상태: http://localhost:8000/v1/scheduler/status
 Open WebUI: http://localhost:3000
 SearXNG: http://localhost:8081
 Agent gateway OpenAI-compatible API: http://localhost:8010/v1

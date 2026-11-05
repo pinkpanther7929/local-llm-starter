@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Smoke test for llm-scheduler: passthrough, priority header, status page.
-# Usage: scripts/scheduler-smoke.sh [base_url=http://10.6.6.56:8020]
+# Usage: scripts/scheduler-smoke.sh [base_url=http://10.6.6.56:8000]
 set -euo pipefail
-BASE="${1:-http://10.6.6.56:8020}"
+BASE="${1:-http://10.6.6.56:8000}"
 MODEL="${SERVED_MODEL_NAME:-qwen3.8-flash-next-iq3_s}"
 
 echo "== models"; curl -fsS "$BASE/v1/models" | head -c 200; echo

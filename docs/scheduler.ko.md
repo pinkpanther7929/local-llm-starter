@@ -35,7 +35,7 @@ Open WebUI --> agent-gateway --> llm-scheduler
 헤더는 보낸 값 그대로 신뢰합니다(사내 LAN 전제). `P0`를 남발하는 호출자는 `/v1/scheduler/status`에서 확인합니다.
 
 ```bash
-curl http://10.6.6.56:8020/v1/chat/completions \
+curl http://10.6.6.56:8000/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -H 'X-LLM-Priority: P0' -H 'X-Caller: my-service' \
   -d '{"model":"qwen3.8-flash-next-iq3_s","messages":[{"role":"user","content":"hi"}]}'
@@ -48,13 +48,13 @@ curl http://10.6.6.56:8020/v1/chat/completions \
 | wiki-relay 수동 재작성 / 되돌리기 | P0 |
 | wiki-relay 커밋 문서 초안 | P1 |
 | wiki-relay 문서 카드 색인 | P2 |
-| Open WebUI (agent-gateway 경유) | P0 (아래 전환 후) |
+| Open WebUI (agent-gateway 경유) | P0 (`UPSTREAM_BASE_URL`이 스케줄러를 가리켜야 함) |
 
 ## 설정 (`.env`)
 
 | 변수 | 기본값 | 설명 |
 | --- | --- | --- |
-| `SCHED_PORT` | `8020` | 호스트 포트. 전환 후 `8000` |
+| `SCHED_PORT` | `8000` | 호스트 포트(Strata는 더 이상 호스트에 노출되지 않음) |
 | `SCHED_CONCURRENCY` | `1` | Strata로 동시에 보내는 생성 수 |
 | `SCHED_AGING_SEC` | `120` | 한 등급 승격까지 대기 초. `0`이면 끔 |
 | `SCHED_DEFAULT_PRIORITY` | `P2` | 헤더도 IP 매칭도 없을 때 등급 |
@@ -66,8 +66,8 @@ curl http://10.6.6.56:8020/v1/chat/completions \
 
 ```bash
 docker compose --profile strata up -d --build llm-scheduler
-scripts/scheduler-smoke.sh http://10.6.6.56:8020
-curl http://10.6.6.56:8020/v1/scheduler/status
+scripts/scheduler-smoke.sh http://10.6.6.56:8000
+curl http://10.6.6.56:8000/v1/scheduler/status
 ```
 
 `/v1/scheduler/status`는 실행 중인 요청, 대기열(에이징 반영 등급 포함), 호출자별 누계(요청 수, 오류, 취소,
@@ -75,19 +75,16 @@ curl http://10.6.6.56:8020/v1/scheduler/status
 
 ## 적용 절차
 
-1. **시험(현재)**: 스케줄러 `:8020`, Strata는 `:8000`으로 직접 접근 가능한 상태. 호출자 하나(예: wiki-relay의
-   `llm_endpoint`)를 `:8020`으로 돌려 검증합니다. `:8000`을 쓰는 호출자는 스케줄러를 거치지 않으므로 이 단계에서는
-   그쪽과의 GPU 경합은 그대로입니다.
-2. **전환**: `:8000`을 유일한 입구로 만듭니다.
-   1. `10.6.6.56:8000`을 쓰는 다른 팀에 먼저 알립니다(보낼 헤더, 헤더 없는 요청은 `P2`로 처리됨).
-   2. `docker-compose.yml`에서 `strata`의 `ports:`를 `expose: ["8000"]`로 바꿉니다.
-   3. `.env`에 `SCHED_PORT=8000`을 설정합니다.
-   4. `agent-gateway`의 `UPSTREAM_BASE_URL`을 `http://llm-scheduler:8000/v1`로 바꿉니다. 안 바꾸면 Open WebUI가
-      도커 내부망으로 Strata에 바로 붙어 큐를 우회합니다. 게이트웨이의 upstream 요청에는
-      `X-LLM-Priority: P0`, `X-Caller: open-webui`도 추가합니다.
-   5. `docker compose --profile strata up -d`
-3. **롤백**: `strata`의 `ports:`를 되돌리고 `SCHED_PORT=8020`, `UPSTREAM_BASE_URL`을 원래대로 둔 뒤
-   `docker compose --profile strata up -d`. 스케줄러만 내리려면 `docker compose --profile strata rm -sf llm-scheduler`.
+compose 파일은 최종 구성을 담고 있습니다. `llm-scheduler`가 호스트 `8000` 포트(`SCHED_PORT`)를 열고, `strata`는
+도커 내부망에만 노출됩니다. `10.6.6.56:8000`을 쓰던 다른 팀은 바꿀 것이 없고, 헤더 없는 요청은 `P2`가 됩니다.
+
+1. 다른 팀에 먼저 알립니다(보낼 헤더, 헤더 없는 요청은 `P2`, Strata가 재생성되어 1~2분 끊김).
+2. `.env`에 `UPSTREAM_BASE_URL=http://llm-scheduler:8000/v1`을 설정합니다(agent-gateway). 안 바꾸면 Open WebUI가
+   도커 내부망으로 Strata에 바로 붙어 큐를 우회합니다.
+3. `docker compose --profile strata up -d --build` 후 `scripts/scheduler-smoke.sh`와 `/v1/scheduler/status`로 확인합니다.
+4. **롤백**: `strata`에 `ports: ["8000:8000"]`을 되돌리고 `SCHED_PORT=8020`, `UPSTREAM_BASE_URL=http://strata:8000/v1`로
+   둔 뒤 `docker compose --profile strata up -d`. 스케줄러만 내리려면
+   `docker compose --profile strata rm -sf llm-scheduler`(이 경우 호출자를 위해 Strata 포트를 다시 열어야 함).
 
 ## 참고
 

@@ -90,9 +90,9 @@ This starts `strata`, `llm-scheduler`, `agent-gateway`, Open WebUI, and SearXNG.
 Backend OpenAI-compatible API:
   vLLM: http://localhost:8000/v1
   Ollama: http://localhost:11434/v1
-  Strata: http://localhost:8000/v1
-LLM scheduler (Strata profile, trial port): http://localhost:8020/v1
-  status: http://localhost:8020/v1/scheduler/status
+  Strata (Strata profile): via the scheduler on 8000
+LLM scheduler (Strata profile, the only entrance on 8000): http://localhost:8000/v1
+  status: http://localhost:8000/v1/scheduler/status
 Open WebUI: http://localhost:3000
 SearXNG: http://localhost:8081
 Agent gateway OpenAI-compatible API: http://localhost:8010/v1

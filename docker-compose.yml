@@ -109,8 +109,9 @@ services:
         soft: -1
         hard: -1
 
-    ports:
-      - "${STRATA_PORT:-8000}:8000"
+    # Not published on the host: llm-scheduler owns host port 8000 and forwards to strata:8000 on the Docker network.
+    expose:
+      - "8000"
 
     volumes:
       - ~/.cache/strata:/root/.local/share/strata
@@ -187,9 +188,9 @@ services:
       - agent-gateway
       - searxng
 
-  # Priority scheduler in front of Strata. Trial: host port 8020 (Strata keeps 8000).
-  # Cutover: SCHED_PORT=8000, drop the `ports:` entry of `strata` (keep it internal), and set
-  # UPSTREAM_BASE_URL=http://llm-scheduler:8000/v1 for agent-gateway.
+  # Priority scheduler in front of Strata: the only entrance on host port 8000 (Strata is internal).
+  # agent-gateway must use UPSTREAM_BASE_URL=http://llm-scheduler:8000/v1 so Open WebUI queues too.
+  # Rollback: restore `ports: ["8000:8000"]` on strata, SCHED_PORT=8020, UPSTREAM_BASE_URL=http://strata:8000/v1.
   llm-scheduler:
     profiles:
       - strata
@@ -201,7 +202,7 @@ services:
     restart: unless-stopped
 
     ports:
-      - "${SCHED_PORT:-8020}:8000"
+      - "${SCHED_PORT:-8000}:8000"
 
     environment:
       SCHED_LISTEN_PORT: "8000"
