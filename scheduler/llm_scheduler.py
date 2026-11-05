@@ -10,6 +10,7 @@ Priority comes from the `X-LLM-Priority` header (trusted as-is, LAN only). Witho
 it the source-IP map (SCHED_IP_PRIORITY) and then SCHED_DEFAULT_PRIORITY apply.
 `X-Caller` is only a label for the status page.
 """
+import hashlib
 import http.client
 import json
 import os
@@ -32,6 +33,8 @@ QUEUED_PATHS = {"/v1/chat/completions", "/v1/completions"}
 HOP_BY_HOP = {"connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "te",
               "trailers", "transfer-encoding", "upgrade", "content-length", "host"}
 TOKENS_RE = re.compile(rb'"completion_tokens"\s*:\s*(\d+)')
+PREFIX_CHARS = 400
+PREFIX_WARN_MIN_REQUESTS = 5
 
 
 def parse_priority(value, default=None):
@@ -101,6 +104,26 @@ class Scheduler:
                                      "waited": now - nxt.enqueued}
             nxt.event.set()
 
+    def note_prefix(self, caller, body):
+        """Track the leading system prompt per caller. Strata reuses its KV cache only for an identical prefix,
+        so a prefix that keeps changing (timestamps, ids) means cache misses; surfaced on the status page."""
+        try:
+            messages = json.loads(body).get("messages") or []
+            first = messages[0] if messages else {}
+            text = first.get("content") if first.get("role") == "system" else ""
+            if isinstance(text, list):
+                text = "".join(part.get("text", "") for part in text if isinstance(part, dict))
+            digest = hashlib.sha1(str(text or "")[:PREFIX_CHARS].encode("utf-8")).hexdigest()[:10] if text else ""
+        except (ValueError, AttributeError, TypeError):
+            return
+        with self.lock:
+            stat = self._stat(caller)
+            stat["prefix_requests"] = stat.get("prefix_requests", 0) + 1
+            if digest and stat.get("prefix_hash") and stat["prefix_hash"] != digest:
+                stat["prefix_changes"] = stat.get("prefix_changes", 0) + 1
+            if digest:
+                stat["prefix_hash"] = digest
+
     def enqueue(self, priority, caller):
         with self.lock:
             self.seq += 1
@@ -142,10 +165,13 @@ class Scheduler:
             callers = {}
             for name, s in self.callers.items():
                 n = max(1, s["requests"] - s["cancelled"])
+                seen, changed = s.get("prefix_requests", 0), s.get("prefix_changes", 0)
+                unstable = seen >= PREFIX_WARN_MIN_REQUESTS and changed / seen > 0.5
                 callers[name] = dict(
                     s, avg_wait_sec=round(s["wait_sec"] / n, 2), avg_run_sec=round(s["run_sec"] / n, 2),
                     tok_per_sec=round(s["completion_tokens"] / s["run_sec"], 1) if s["run_sec"] else 0.0,
-                    wait_sec=round(s["wait_sec"], 2), run_sec=round(s["run_sec"], 2))
+                    wait_sec=round(s["wait_sec"], 2), run_sec=round(s["run_sec"], 2),
+                    prefix_unstable=unstable)
             return {
                 "concurrency": self.concurrency, "aging_sec": self.aging_sec, "upstream": UPSTREAM,
                 "uptime_sec": int(time.time() - self.started),
@@ -207,6 +233,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._forward(body)
         priority = resolve_priority(self.headers.get("X-LLM-Priority"), self.client_address[0])
         caller = (self.headers.get("X-Caller") or self.client_address[0]).strip()[:64] or "unknown"
+        self.scheduler.note_prefix(caller, body)
         waiter = self.scheduler.enqueue(priority, caller)
         while not waiter.event.wait(1.0):
             if client_closed(self.connection):

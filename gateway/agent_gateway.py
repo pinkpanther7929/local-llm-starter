@@ -25,6 +25,9 @@ SEARXNG_URL = os.environ.get("SEARXNG_URL", "http://searxng:8080/search")
 HOST = os.environ.get("GATEWAY_HOST", "0.0.0.0")
 PORT = int(os.environ.get("GATEWAY_PORT", "8010"))
 MAX_TOOL_ROUNDS = int(os.environ.get("MAX_TOOL_ROUNDS", "4"))
+# Sent to the LLM scheduler (llm-scheduler) so Open WebUI questions are queued as interactive (P0).
+LLM_PRIORITY = os.environ.get("LLM_PRIORITY", "P0")
+LLM_CALLER = os.environ.get("LLM_CALLER", "open-webui")
 HTTP_TIMEOUT_SECONDS = int(os.environ.get("HTTP_TIMEOUT_SECONDS", "20"))
 LLM_TIMEOUT_SECONDS = int(os.environ.get("LLM_TIMEOUT_SECONDS", "600"))
 UPSTREAM_RETRIES = int(os.environ.get("UPSTREAM_RETRIES", "6"))
@@ -214,10 +217,13 @@ def request_json(url, payload=None, timeout=HTTP_TIMEOUT_SECONDS, retries=UPSTRE
         else:
             data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
             method = "POST"
+        headers = {"Content-Type": "application/json; charset=utf-8"}
+        if url.startswith(UPSTREAM_BASE_URL):
+            headers.update({"X-LLM-Priority": LLM_PRIORITY, "X-Caller": LLM_CALLER})
         request = urllib.request.Request(
             url,
             data=data,
-            headers={"Content-Type": "application/json; charset=utf-8"},
+            headers=headers,
             method=method,
         )
         opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
