@@ -6,3 +6,9 @@ __pycache__/
 .pytest_cache/
 knowledge/
 runtime/
+
+# ad-hoc wiki/page fetch scripts (local only)
+/fetch_page*.py
+/fetch_page*.ps1
+/update_wiki_ai_expansion.py
+/verify_wiki_*.ps1

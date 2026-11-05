@@ -187,6 +187,34 @@ services:
       - agent-gateway
       - searxng
 
+  # Priority scheduler in front of Strata. Trial: host port 8020 (Strata keeps 8000).
+  # Cutover: SCHED_PORT=8000, drop the `ports:` entry of `strata` (keep it internal), and set
+  # UPSTREAM_BASE_URL=http://llm-scheduler:8000/v1 for agent-gateway.
+  llm-scheduler:
+    profiles:
+      - strata
+
+    build:
+      context: ./scheduler
+
+    container_name: local-llm-scheduler
+    restart: unless-stopped
+
+    ports:
+      - "${SCHED_PORT:-8020}:8000"
+
+    environment:
+      SCHED_LISTEN_PORT: "8000"
+      SCHED_UPSTREAM: ${SCHED_UPSTREAM:-http://strata:8000}
+      SCHED_CONCURRENCY: ${SCHED_CONCURRENCY:-1}
+      SCHED_AGING_SEC: ${SCHED_AGING_SEC:-120}
+      SCHED_DEFAULT_PRIORITY: ${SCHED_DEFAULT_PRIORITY:-P2}
+      SCHED_IP_PRIORITY: ${SCHED_IP_PRIORITY:-}
+      SCHED_UPSTREAM_TIMEOUT: ${SCHED_UPSTREAM_TIMEOUT:-900}
+
+    depends_on:
+      - strata
+
   agent-gateway:
     build:
       context: ./gateway
