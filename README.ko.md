@@ -3,14 +3,16 @@
 [English](README.md) | Korean
 
 Open WebUI에서 웹 검색이 가능한 로컬 LLM을 빠르게 실행하기 위한 starter kit입니다.
-vLLM 또는 Ollama backend 앞에 Open WebUI, SearXNG, OpenAI 호환 agent gateway를 구성합니다.
+vLLM, Ollama, Strata(Qwen3.8-Flash-Next 128K) backend 앞에 Open WebUI, SearXNG, OpenAI 호환 agent gateway를 구성합니다.
+Strata profile에는 여러 서비스가 GPU 한 대를 나눠 쓸 수 있도록 우선순위 스케줄러가 포함됩니다.
 
 ## 기능
 
 - Open WebUI를 기본 채팅 UI로 사용합니다.
 - SearXNG를 로컬 웹 검색 backend로 사용합니다.
 - Agent gateway가 OpenAI 호환 `/v1/models`, `/v1/chat/completions`를 제공합니다.
-- vLLM과 Ollama backend profile을 지원합니다.
+- vLLM, Ollama, Strata backend profile을 지원합니다.
+- Strata 앞단 우선순위 스케줄러(`llm-scheduler`): `X-LLM-Priority` 헤더로 `P0/P1/P2` 큐 처리, `/v1/scheduler/status`로 상태 확인.
 - 포트, 모델 이름, runtime 설정을 `.env`로 관리합니다.
 - 새 머신에서 반복 가능한 설정을 위해 model guide와 troubleshooting 문서를 제공합니다.
 
@@ -81,12 +83,24 @@ Qwen3.8 native context를 사용하므로 YaRN은 적용하지 않습니다. 이
 안정성 이슈를 관찰하는 동안 Triton attention을 고정하고 FlashInfer sampler는 끕니다.
 checkpoint는 Qwen 공식 quantization이 아닌 community AWQ입니다.
 
+## Strata (Qwen3.8-Flash-Next 128K)
+
+```bash
+docker compose --env-file profiles/strata-qwen3.8-flash-next-128k.env --profile strata up -d --build
+```
+
+`strata`, `llm-scheduler`, `agent-gateway`, Open WebUI, SearXNG가 함께 올라옵니다. profile은
+[모델 가이드](docs/model-guide.ko.md), 우선순위와 적용 절차는 [LLM 스케줄러](docs/scheduler.ko.md)를 참고하세요.
+
 ## Endpoint
 
 ```text
 Backend OpenAI-compatible API:
   vLLM: http://localhost:8000/v1
   Ollama: http://localhost:11434/v1
+  Strata: http://localhost:8000/v1
+LLM scheduler (Strata profile, 시험 포트): http://localhost:8020/v1
+  상태: http://localhost:8020/v1/scheduler/status
 Open WebUI: http://localhost:3000
 SearXNG: http://localhost:8081
 Agent gateway OpenAI-compatible API: http://localhost:8010/v1
@@ -159,6 +173,7 @@ vLLM 실행 옵션에는 `--generation-config vllm`을 넣어 모델의 `generat
 - 이 설정은 단일 RTX 4090 24GB에서 `google/gemma-4-12B-it`가 메모리/버전 문제를 낸 뒤 `Qwen/Qwen3-14B-AWQ`로 검증했습니다.
 - AWQ INT4 모델은 24GB VRAM에서 BF16/FP16 모델보다 현실적입니다.
 - Open WebUI는 agent gateway의 container DNS URL인 `http://agent-gateway:8010/v1`을 사용합니다.
+- Strata profile에서 GPU를 공유하는 서비스는 스케줄러를 호출하고 `X-LLM-Priority: P0|P1|P2`(와 `X-Caller`) 헤더를 보내야 합니다. 헤더가 없으면 `P2`로 처리됩니다. agent gateway는 `UPSTREAM_BASE_URL`을 `http://llm-scheduler:8000/v1`로 바꾸기 전까지 도커 내부망으로 Strata에 직접 붙습니다. 전환 절차는 [LLM 스케줄러](docs/scheduler.ko.md)를 참고하세요.
 - Web tool 없는 raw model 호출은 backend endpoint로 직접 보낼 수 있습니다.
 - SearXNG JSON output은 `searxng/settings.yml`에서 켜져 있습니다. 외부에 노출하기 전 `server.secret_key`를 바꾸세요.
 - `fetch_url`은 SSRF 위험을 줄이기 위해 private, loopback, link-local, multicast, reserved address를 차단합니다.
@@ -168,6 +183,7 @@ vLLM 실행 옵션에는 `--generation-config vllm`을 넣어 모델의 `generat
 
 - [모델 가이드](docs/model-guide.ko.md)
 - [운영](docs/operations.ko.md)
+- [LLM 스케줄러](docs/scheduler.ko.md)
 - [Hermes Agent 연동](docs/hermes-agent.ko.md)
 - [개인 지식 도구](docs/personal-knowledge.ko.md)
 - [문제 해결](docs/troubleshooting.ko.md)

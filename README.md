@@ -3,14 +3,16 @@
 English | [Korean](README.ko.md)
 
 Reusable starter kit for running a local LLM with web search in Open WebUI.
-It runs Open WebUI, SearXNG, and an OpenAI-compatible agent gateway in front of either vLLM or Ollama.
+It runs Open WebUI, SearXNG, and an OpenAI-compatible agent gateway in front of vLLM, Ollama, or Strata
+(Qwen3.8-Flash-Next 128K). The Strata profile adds a priority scheduler so several services can share one GPU.
 
 ## Features
 
 - Open WebUI as the primary chat UI.
 - SearXNG as the local web search backend.
 - Agent gateway that exposes OpenAI-compatible `/v1/models` and `/v1/chat/completions`.
-- Backend profiles for vLLM and Ollama.
+- Backend profiles for vLLM, Ollama, and Strata.
+- Priority scheduler (`llm-scheduler`) in front of Strata: `P0/P1/P2` queue via the `X-LLM-Priority` header, status page at `/v1/scheduler/status`.
 - Environment-based ports, model names, and runtime settings.
 - Model guide and troubleshooting docs for repeatable setup on new machines.
 
@@ -73,12 +75,24 @@ docker compose --env-file profiles/ollama-qwen3.env --profile ollama up -d
 docker exec -it ollama ollama pull qwen3:8b
 ```
 
+### Strata (Qwen3.8-Flash-Next 128K)
+
+```bash
+docker compose --env-file profiles/strata-qwen3.8-flash-next-128k.env --profile strata up -d --build
+```
+
+This starts `strata`, `llm-scheduler`, `agent-gateway`, Open WebUI, and SearXNG. See the
+[Model Guide](docs/model-guide.md) for the profile and the [LLM Scheduler](docs/scheduler.md) for priorities.
+
 ## Endpoints
 
 ```text
 Backend OpenAI-compatible API:
   vLLM: http://localhost:8000/v1
   Ollama: http://localhost:11434/v1
+  Strata: http://localhost:8000/v1
+LLM scheduler (Strata profile, trial port): http://localhost:8020/v1
+  status: http://localhost:8020/v1/scheduler/status
 Open WebUI: http://localhost:3000
 SearXNG: http://localhost:8081
 Agent gateway OpenAI-compatible API: http://localhost:8010/v1
@@ -130,6 +144,7 @@ Max model length: 12288
 - This setup was validated with `Qwen/Qwen3-14B-AWQ` after `google/gemma-4-12B-it` hit memory/version issues on a single RTX 4090 24GB.
 - AWQ INT4 is more practical for 24GB VRAM than BF16/FP16 models.
 - Open WebUI uses the agent gateway container DNS URL `http://agent-gateway:8010/v1`.
+- With the Strata profile, services that share the GPU should call the scheduler and send `X-LLM-Priority: P0|P1|P2` (and `X-Caller`). Requests without the header are treated as `P2`. The agent gateway reaches Strata directly over the Docker network until `UPSTREAM_BASE_URL` points at `http://llm-scheduler:8000/v1`; see the cutover steps in [LLM Scheduler](docs/scheduler.md).
 - Raw model calls without web tools can go directly to the backend endpoint.
 - SearXNG JSON output is enabled in `searxng/settings.yml`; change `server.secret_key` before exposing SearXNG beyond localhost.
 - `fetch_url` blocks private, loopback, link-local, multicast, and reserved addresses to reduce SSRF risk.
@@ -139,6 +154,7 @@ Max model length: 12288
 
 - [Model Guide](docs/model-guide.md)
 - [Operations](docs/operations.md)
+- [LLM Scheduler](docs/scheduler.md)
 - [Hermes Agent Integration](docs/hermes-agent.md)
 - [Personal Knowledge Tools](docs/personal-knowledge.md)
 - [Troubleshooting](docs/troubleshooting.md)

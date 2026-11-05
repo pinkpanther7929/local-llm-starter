@@ -62,7 +62,7 @@ SMOKE_CHAT_TIMEOUT=180 scripts/smoke-test.sh
 
 ## Switching Backend Containers (Strata ↔ vLLM)
 
-Both `strata` and `vllm` bind host port `8000` and allocate GPU VRAM. Stop the active backend container (`--restart=no`) before copying the target profile to `.env` and starting the new backend. Model caches (`~/.cache/strata`, `~/.cache/huggingface`) persist on host volumes across switches.
+Both `strata` and `vllm` bind host port `8000` and allocate GPU VRAM. `llm-scheduler` belongs to the `strata` profile only, so it goes down with Strata; if `agent-gateway`'s `UPSTREAM_BASE_URL` pointed at `llm-scheduler`, set it back to `http://vllm:8000/v1` (see [LLM Scheduler](scheduler.md)). Stop the active backend container (`--restart=no`) before copying the target profile to `.env` and starting the new backend. Model caches (`~/.cache/strata`, `~/.cache/huggingface`) persist on host volumes across switches.
 
 API endpoints (`:8000/v1`, `:8010/v1`) and request payloads (`chat_template_kwargs.enable_thinking=false`) remain identical; only the `model` ID (`qwen3.8-flash-next-iq3_s` vs `qwen3.8-27b`) changes when calling `:8000/v1` directly.
 

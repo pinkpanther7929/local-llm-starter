@@ -84,7 +84,7 @@ SMOKE_CHAT_TIMEOUT=180 scripts/smoke-test.sh
 
 ## 백엔드 컨테이너 스위칭 (Strata ↔ vLLM)
 
-`strata`와 `vllm` 모두 호스트 `8000` 포트와 GPU(VRAM)를 점유합니다. 전환 시 기존 컨테이너를 먼저 중지(`--restart=no` 포함)한 뒤 목표 profile을 `.env`에 반영하고 기동합니다. 모델 캐시(`~/.cache/strata`, `~/.cache/huggingface`)는 호스트 볼륨에 유지되므로 재다운로드 없이 전환됩니다.
+`strata`와 `vllm` 모두 호스트 `8000` 포트와 GPU(VRAM)를 점유합니다. `llm-scheduler`는 `strata` profile에만 속하므로 vLLM으로 전환하면 함께 내려가며, `agent-gateway`의 `UPSTREAM_BASE_URL`이 `llm-scheduler`를 가리키고 있었다면 `http://vllm:8000/v1`로 되돌려야 합니다([LLM 스케줄러](scheduler.ko.md)). 전환 시 기존 컨테이너를 먼저 중지(`--restart=no` 포함)한 뒤 목표 profile을 `.env`에 반영하고 기동합니다. 모델 캐시(`~/.cache/strata`, `~/.cache/huggingface`)는 호스트 볼륨에 유지되므로 재다운로드 없이 전환됩니다.
 
 API 엔드포인트(`:8000/v1`, `:8010/v1`)와 요청 포맷(`chat_template_kwargs.enable_thinking=false` 등)은 두 백엔드에서 100% 동일하며, 직접 `:8000/v1` 호출 시 `model` 이름만 활성 모델(`qwen3.8-flash-next-iq3_s` 또는 `qwen3.8-27b`)에 맞추면 됩니다(`:8010/v1` 게이트웨이는 `model` 생략 시 기본 모델로 자동 라우팅).
 
