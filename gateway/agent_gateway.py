@@ -1,17 +1,41 @@
-import ipaddress
-import contextvars
+"""Agent gateway: the API entrance, a thin tool-calling loop in front of llm-scheduler.
+
+    client -> agent-gateway -> llm-scheduler -> backend (strata | vllm | ollama)
+                   |
+                   +-> tool-service  (web search, URL fetch, repository files / P4)
+
+The gateway does not decide whether a question needs a tool. It hands the model the tool
+schemas (fetched from tool-service) and lets the model ask for one with a structured
+`tool_calls` response. The gateway runs that call through tool-service, feeds the result
+back, and repeats. A request the model answers without a tool is relayed untouched, with
+real streaming. Anything it does not handle itself (`/v1/models`, embeddings, the scheduler
+status page, ...) is relayed to the scheduler as is.
+
+Rules for tool calls:
+  * only tools owned by tool-service are executed here; a tool the client declared itself
+    is returned to the client unchanged;
+  * the client's own `tools` are kept, and `tool_choice` other than "auto" turns gateway
+    tools off for that request, as does the header `X-Agent-Tools: off`;
+  * Open WebUI's background prompts ("### Task:") never get tools.
+
+Two listeners share the code:
+  * api       (GATEWAY_PORT, published): priority and caller come from the client's
+              `X-LLM-Priority` / `X-Caller` headers, else the scheduler's defaults.
+  * internal  (GATEWAY_INTERNAL_PORT, Docker network only, used by Open WebUI): fixed
+              LLM_PRIORITY / LLM_CALLER and thinking off by default.
+"""
+import http.client
 import json
 import os
-import re
-import shutil
+import select
 import socket
-import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from html.parser import HTMLParser
+import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 
@@ -21,997 +45,191 @@ UPSTREAM_BASE_URL = (
     or os.environ.get("VLLM_BASE_URL")
     or "http://vllm:8000/v1"
 ).rstrip("/")
-SEARXNG_URL = os.environ.get("SEARXNG_URL", "http://searxng:8080/search")
+TOOL_SERVICE_URL = os.environ.get("TOOL_SERVICE_URL", "").rstrip("/")
+TOOLS_ENABLED = os.environ.get("GATEWAY_TOOLS_ENABLED", "true").lower() not in {"0", "false", "no"}
 HOST = os.environ.get("GATEWAY_HOST", "0.0.0.0")
-PORT = int(os.environ.get("GATEWAY_PORT", "8010"))
+PORT = int(os.environ.get("GATEWAY_PORT", "8000"))
+INTERNAL_PORT = int(os.environ.get("GATEWAY_INTERNAL_PORT", "8010"))
 MAX_TOOL_ROUNDS = int(os.environ.get("MAX_TOOL_ROUNDS", "4"))
-# Sent to the LLM scheduler (llm-scheduler) so Open WebUI questions are queued as interactive (P0).
+# The internal listener (Open WebUI) queues as interactive by default.
 LLM_PRIORITY = os.environ.get("LLM_PRIORITY", "P0")
 LLM_CALLER = os.environ.get("LLM_CALLER", "open-webui")
 HTTP_TIMEOUT_SECONDS = int(os.environ.get("HTTP_TIMEOUT_SECONDS", "20"))
 LLM_TIMEOUT_SECONDS = int(os.environ.get("LLM_TIMEOUT_SECONDS", "600"))
-UPSTREAM_RETRIES = int(os.environ.get("UPSTREAM_RETRIES", "6"))
-UPSTREAM_RETRY_DELAY_SECONDS = float(os.environ.get("UPSTREAM_RETRY_DELAY_SECONDS", "2"))
-FETCH_MAX_BYTES = int(os.environ.get("FETCH_MAX_BYTES", "1048576"))
-FETCH_MAX_CHARS = int(os.environ.get("FETCH_MAX_CHARS", "12000"))
-SEARCH_RESULT_LIMIT = int(os.environ.get("SEARCH_RESULT_LIMIT", "5"))
+TOOL_TIMEOUT_SECONDS = int(os.environ.get("TOOL_TIMEOUT_SECONDS", "700"))
+TOOL_CACHE_SECONDS = float(os.environ.get("TOOL_CACHE_SECONDS", "30"))
+MAX_BODY_BYTES = int(os.environ.get("MAX_BODY_BYTES", str(64 * 1024 * 1024)))
 DEFAULT_MODEL = os.environ.get("DEFAULT_MODEL", "qwen-14b")
-AUTO_SEARCH = os.environ.get("AUTO_SEARCH", "true").lower() not in {"0", "false", "no"}
-WEB_SEARCH_POLICY = os.environ.get("WEB_SEARCH_POLICY", "keyword" if AUTO_SEARCH else "off").lower()
-FETCH_URL_ENABLED = os.environ.get("FETCH_URL_ENABLED", "true").lower() not in {"0", "false", "no"}
 MODEL_LIST_FALLBACK = os.environ.get("MODEL_LIST_FALLBACK", "true").lower() not in {"0", "false", "no"}
-FILE_SEARCH_ENABLED = os.environ.get("FILE_SEARCH_ENABLED", "false").lower() in {"1", "true", "yes"}
-FILE_SEARCH_POLICY = os.environ.get("FILE_SEARCH_POLICY", "keyword").lower()
-P4_SYNC_ENABLED = os.environ.get("P4_SYNC_ENABLED", "false").lower() in {"1", "true", "yes"}
-P4_SYNC_SOCKET = os.environ.get("P4_SYNC_SOCKET", "/p4-sync/sync.sock")
-P4_SYNC_TIMEOUT_SECONDS = int(os.environ.get("P4_SYNC_TIMEOUT_SECONDS", "600"))
-FILE_SYNC_STATE = contextvars.ContextVar("file_sync_state", default=None)
-FILE_SEARCH_RESULT_LIMIT = int(os.environ.get("FILE_SEARCH_RESULT_LIMIT", "5"))
-FILE_SEARCH_MAX_FILE_BYTES = int(os.environ.get("FILE_SEARCH_MAX_FILE_BYTES", "262144"))
-FILE_SEARCH_MAX_CHARS = int(os.environ.get("FILE_SEARCH_MAX_CHARS", "1200"))
-FILE_READ_MAX_LINES = int(os.environ.get("FILE_READ_MAX_LINES", "120"))
-FILE_SEARCH_EXTENSIONS = {
-    item.strip().lower()
-    for item in os.environ.get(
-        "FILE_SEARCH_EXTENSIONS",
-        ".txt,.md,.rst,.py,.ps1,.bat,.cmd,.sh,.json,.yaml,.yml,.toml,.ini,.cfg,.xml,.html,.css,.js,.ts,.cs,.cpp,.h,.hpp,.java,.go,.rs,.sql,.log",
-    ).split(",")
-    if item.strip()
-}
+
+HOP_BY_HOP = {"connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "te",
+              "trailers", "transfer-encoding", "upgrade", "content-length", "host"}
+# Headers that are the gateway's own business and are not forwarded to the scheduler.
+GATEWAY_ONLY_HEADERS = {"x-agent-tools"}
+SYNTHETIC_FINISH = "stop"
 
 
-def parse_path_list(value):
-    paths = []
-    for chunk in (value or "").replace("\n", ";").split(";"):
-        path = chunk.strip()
-        if path:
-            paths.append(os.path.realpath(path))
-    return paths
+class ClientGone(Exception):
+    """The caller closed its connection; stop work for it."""
 
 
-FILE_SEARCH_PATHS = parse_path_list(os.environ.get("FILE_SEARCH_PATHS", ""))
-FILE_TOOLS_ENABLED = FILE_SEARCH_ENABLED and FILE_SEARCH_POLICY != "off"
-WEB_TOOLS_ENABLED = WEB_SEARCH_POLICY != "off"
-
-SYSTEM_TOOL_HINT = (
-    "You can use enabled tools for current web information and configured local files. "
-    "Use search_web for web discovery and fetch_url to read a result page when web tools are enabled. "
-    "Cite source URLs in the final answer when web tools are used. "
-    "Do not print tool call XML or JSON in the answer. "
-    "Do not ask the user to wait; call a tool or answer with the evidence already provided."
-)
-if FILE_TOOLS_ENABLED:
-    SYSTEM_TOOL_HINT += (
-        " You can also use local read-only file tools when the user asks about configured local files, notes, or code. "
-        "Use list_files to inspect directories or find filenames, search_files to search file contents (optionally scoped by path such as 'src'), and read_file_excerpt to inspect a small line range."
-        " For Korean repository/code questions (저장소, 소스, 코드, 함수), use these tools too."
-        " Search concise identifiers or filenames, not a whole conversational sentence."
-        " If file tools or sync fail, report that failure; never claim the latest source was verified."
-    )
-
-BLOCKED_HOSTS = {"localhost", "localhost.localdomain"}
+class UpstreamError(Exception):
+    """The scheduler or backend could not be reached."""
 
 
-class TextExtractor(HTMLParser):
-    def __init__(self):
-        super().__init__()
-        self._skip_depth = 0
-        self.parts = []
+class EmptyCompletionError(RuntimeError):
+    """Upstream answered, but with nothing in it."""
 
-    def handle_starttag(self, tag, attrs):
-        if tag in {"script", "style", "noscript", "svg"}:
-            self._skip_depth += 1
 
-    def handle_endtag(self, tag):
-        if tag in {"script", "style", "noscript", "svg"} and self._skip_depth:
-            self._skip_depth -= 1
-
-    def handle_data(self, data):
-        if not self._skip_depth:
-            text = " ".join((data or "").split())
-            if text:
-                self.parts.append(text)
-
-    def text(self):
-        return "\n".join(self.parts)
+def log(message):
+    print(message, flush=True)
 
 
 def now_ms():
     return int(time.time() * 1000)
 
 
-def json_response(handler, status, payload):
-    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-    try:
-        handler.send_response(status)
-        handler.send_header("Content-Type", "application/json; charset=utf-8")
-        handler.send_header("Content-Length", str(len(body)))
-        handler.end_headers()
-        handler.wfile.write(body)
-        handler.wfile.flush()
-    except (BrokenPipeError, ConnectionResetError):
-        handler.close_connection = True
+# --------------------------------------------------------------------------------------
+# Upstream (llm-scheduler)
+# --------------------------------------------------------------------------------------
 
-
-def stream_chat_response(handler, response):
-    try:
-        handler.send_response(200)
-        handler.send_header("Content-Type", "text/event-stream; charset=utf-8")
-        handler.send_header("Cache-Control", "no-cache")
-        handler.send_header("Connection", "close")
-        handler.end_headers()
-        handler.close_connection = True
-
-        choice = (response.get("choices") or [{}])[0]
-        message = choice.get("message") or {}
-        content = message.get("content") or ""
-        chunk_base = {
-            "id": response.get("id", "chatcmpl-local"),
-            "object": "chat.completion.chunk",
-            "created": response.get("created", int(time.time())),
-            "model": response.get("model", DEFAULT_MODEL),
-        }
-        role_chunk = dict(chunk_base)
-        role_chunk["choices"] = [
-            {
-                "index": 0,
-                "delta": {"role": "assistant"},
-                "finish_reason": None,
-            }
-        ]
-        handler.wfile.write("data: {}\n\n".format(json.dumps(role_chunk, ensure_ascii=False)).encode("utf-8"))
-        handler.wfile.flush()
-
-        content_chunk = dict(chunk_base)
-        content_chunk["choices"] = [
-            {
-                "index": 0,
-                "delta": {"content": content},
-                "finish_reason": None,
-            }
-        ]
-        handler.wfile.write("data: {}\n\n".format(json.dumps(content_chunk, ensure_ascii=False)).encode("utf-8"))
-        handler.wfile.flush()
-
-        done_chunk = dict(chunk_base)
-        done_chunk["choices"] = [
-            {
-                "index": 0,
-                "delta": {},
-                "finish_reason": choice.get("finish_reason") or "stop",
-            }
-        ]
-        handler.wfile.write("data: {}\n\n".format(json.dumps(done_chunk, ensure_ascii=False)).encode("utf-8"))
-        handler.wfile.write(b"data: [DONE]\n\n")
-        handler.wfile.flush()
-    except (BrokenPipeError, ConnectionResetError):
-        handler.close_connection = True
-
-
-def fallback_models_response():
-    return {
-        "object": "list",
-        "data": [
-            {
-                "id": DEFAULT_MODEL,
-                "object": "model",
-                "created": 0,
-                "owned_by": "local-llm-agent-gateway",
-            }
-        ],
-    }
-
-
-def read_json_request(handler):
-    length = int(handler.headers.get("Content-Length") or "0")
-    raw = handler.rfile.read(length).decode("utf-8", errors="replace")
-    return json.loads(raw or "{}")
-
-
-def request_json(url, payload=None, timeout=HTTP_TIMEOUT_SECONDS, retries=UPSTREAM_RETRIES):
-    last_error = None
-    for attempt in range(retries + 1):
-        if payload is None:
-            data = None
-            method = "GET"
-        else:
-            data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-            method = "POST"
-        headers = {"Content-Type": "application/json; charset=utf-8"}
-        if url.startswith(UPSTREAM_BASE_URL):
-            headers.update({"X-LLM-Priority": LLM_PRIORITY, "X-Caller": LLM_CALLER})
-        request = urllib.request.Request(
-            url,
-            data=data,
-            headers=headers,
-            method=method,
-        )
-        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-        try:
-            with opener.open(request, timeout=timeout) as response:
-                text = response.read().decode("utf-8", errors="replace")
-            return json.loads(text)
-        except (ConnectionRefusedError, TimeoutError, urllib.error.URLError) as exc:
-            # Retrying an invalid chat template/request cannot repair it.
-            if isinstance(exc, urllib.error.HTTPError) and 400 <= exc.code < 500 and exc.code not in {408, 429}:
-                raise
-            last_error = exc
-            if attempt >= retries:
-                break
-            time.sleep(UPSTREAM_RETRY_DELAY_SECONDS)
-    raise last_error
-
-
-def open_url(url, timeout=HTTP_TIMEOUT_SECONDS, max_bytes=FETCH_MAX_BYTES):
-    request = urllib.request.Request(
-        url,
-        headers={
-            "User-Agent": "local-llm-agent-gateway/1.0",
-            "Accept": "text/html,text/plain,application/xhtml+xml,application/json;q=0.8,*/*;q=0.2",
-        },
-        method="GET",
-    )
-    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-    with opener.open(request, timeout=timeout) as response:
-        content_type = response.headers.get("Content-Type", "")
-        raw = response.read(max_bytes + 1)
-        truncated = len(raw) > max_bytes
-        raw = raw[:max_bytes]
-        text = raw.decode("utf-8", errors="replace")
-    return content_type, text, truncated
-
-
-def normalize_hostname(hostname):
-    return (hostname or "").strip().rstrip(".").lower()
-
-
-def assert_public_url(url):
+def _split(url):
     parsed = urllib.parse.urlparse(url)
-    if parsed.scheme not in {"http", "https"}:
-        raise ValueError("Only http and https URLs are allowed.")
-    host = normalize_hostname(parsed.hostname)
-    if not host or host in BLOCKED_HOSTS:
-        raise ValueError("Blocked host.")
+    return parsed.hostname, parsed.port or 80, parsed.path.rstrip("/")
+
+
+UPSTREAM_HOST, UPSTREAM_PORT, UPSTREAM_PREFIX = _split(UPSTREAM_BASE_URL)
+# `/v1/...` requests are relayed to <root>/v1/..., so strip the /v1 that UPSTREAM_BASE_URL ends with.
+UPSTREAM_ROOT_PREFIX = UPSTREAM_PREFIX[:-3] if UPSTREAM_PREFIX.endswith("/v1") else UPSTREAM_PREFIX
+
+
+def client_closed(sock):
+    """True when the peer already closed the connection (checked without consuming data)."""
     try:
-        ipaddress.ip_address(host)
-        addresses = [host]
-    except ValueError:
-        addresses = [item[4][0] for item in socket.getaddrinfo(host, parsed.port or 443, type=socket.SOCK_STREAM)]
-    for address in addresses:
-        ip = ipaddress.ip_address(address)
-        if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_multicast or ip.is_reserved:
-            raise ValueError("Blocked private or non-public address.")
+        readable, _, _ = select.select([sock], [], [], 0)
+        return bool(readable) and sock.recv(1, socket.MSG_PEEK) == b""
+    except (OSError, ValueError):
+        return True
 
 
-def tool_search_web(arguments):
-    query = str(arguments.get("query") or "").strip()
-    if not query:
-        raise ValueError("query is required")
-    limit = int(arguments.get("limit") or SEARCH_RESULT_LIMIT)
-    limit = max(1, min(limit, SEARCH_RESULT_LIMIT))
-    params = urllib.parse.urlencode({"q": query, "format": "json"})
-    separator = "&" if "?" in SEARXNG_URL else "?"
-    data = request_json(SEARXNG_URL + separator + params)
-    results = []
-    for item in data.get("results", [])[:limit]:
-        results.append(
-            {
-                "title": item.get("title", ""),
-                "url": item.get("url", ""),
-                "content": item.get("content", ""),
-                "engine": item.get("engine", ""),
-            }
-        )
-    return {"query": query, "results": results}
+def open_upstream(method, path, body, headers, timeout, client_sock=None):
+    """Send a request and return (connection, response) once the response headers arrive.
 
+    While the scheduler holds the request in its queue nothing comes back, so the caller's
+    socket is watched: if it goes away the upstream connection is closed, which makes the
+    scheduler drop the queued request instead of generating for nobody.
+    """
+    conn = http.client.HTTPConnection(UPSTREAM_HOST, UPSTREAM_PORT, timeout=timeout)
+    box = {}
 
-def html_to_text(html):
-    parser = TextExtractor()
-    parser.feed(html)
-    return parser.text()
-
-
-def tool_fetch_url(arguments):
-    url = str(arguments.get("url") or "").strip()
-    if not url:
-        raise ValueError("url is required")
-    assert_public_url(url)
-    content_type, body, truncated = open_url(url)
-    if "html" in content_type.lower():
-        text = html_to_text(body)
-    else:
-        text = body
-    text = text[:FETCH_MAX_CHARS]
-    return {"url": url, "content_type": content_type, "truncated": truncated, "text": text}
-
-
-SKIP_DIRS = {".git", ".hg", ".svn", "__pycache__", ".pytest_cache", ".venv", "node_modules", "dist", "build", "Binaries", "Intermediate", "DerivedDataCache", "Saved", "SourceAssets", "ThirdParty"}
-DEFERRED_HEAVY_DIRS = {
-    item.strip().lower()
-    for item in os.environ.get(
-        "FILE_SEARCH_DEFERRED_DIRS",
-        "engine,vendor,third_party,thirdparty,external",
-    ).split(",")
-    if item.strip()
-}
-
-SEARCH_STOPWORDS = {
-    "a", "an", "and", "are", "as", "at", "be", "by", "code", "file", "files",
-    "find", "for", "from", "function", "class", "how", "in", "implementation",
-    "is", "it", "line", "lines", "local", "of", "on", "only", "or", "path",
-    "perforce", "read", "repo", "repository", "search", "show", "snippet",
-    "source", "the", "to", "what", "where", "with",
-    "검색", "검색해", "검색해줘", "관련", "구현", "내용", "대해", "대한",
-    "로컬", "로컬파일", "메서드", "무엇", "뭔지", "보여줘", "부분", "설명",
-    "설명해줘", "소스", "소스를", "소스코드", "어디", "어디에", "어떻게",
-    "알려", "알려줘", "있나", "있는", "있는지", "있어", "저장소", "찾아",
-    "찾아봐", "찾아줘", "코드", "코드를", "클래스", "파일", "파일내용",
-    "퍼포스", "함수", "해줘", "확인", "확인해", "확인해줘",
-}
-
-KOREAN_PARTICLES = (
-    "에서부터", "으로부터", "에서", "으로", "부터", "까지", "에게", "한테",
-    "이랑", "하고", "보다", "처럼", "마다", "조차", "마저", "이나", "이란",
-    "은", "는", "이", "가", "을", "를", "의", "에", "로", "도", "만", "과", "와",
-)
-
-
-def strip_korean_particle(token):
-    for particle in KOREAN_PARTICLES:
-        if token.endswith(particle) and len(token) - len(particle) >= 2:
-            return token[: -len(particle)]
-    return token
-
-
-def extract_search_terms(query):
-    raw_Text = (query or "").strip()
-    if not raw_Text:
-        return []
-    # Split ASCII identifiers/paths cleanly from adjacent Hangul syllables so
-    # "CharacterMovement에서" -> ["charactermovement", "에서"].
-    chunks = re.findall(r"[A-Za-z0-9_./:-]+|[가-힣]+", raw_Text)
-    cleaned = []
-    filtered = []
-    for chunk in chunks:
-        token = chunk.strip("._/:-").lower()
-        if not token:
-            continue
-        if re.match(r"^[가-힣]+$", token):
-            token = strip_korean_particle(token)
-        if len(token) < 2 and not token.isdigit():
-            continue
-        if token not in cleaned:
-            cleaned.append(token)
-        if token not in SEARCH_STOPWORDS and token not in KOREAN_PARTICLES and token not in filtered:
-            filtered.append(token)
-    return filtered or cleaned or [raw_Text.lower()]
-
-
-def require_file_search_enabled():
-    if not FILE_TOOLS_ENABLED:
-        raise ValueError("Local file search is disabled.")
-    if not FILE_SEARCH_PATHS:
-        raise ValueError("FILE_SEARCH_PATHS is empty.")
-    ensure_repository_synced()
-
-
-def ensure_repository_synced():
-    if not P4_SYNC_ENABLED:
-        return
-    state = FILE_SYNC_STATE.get()
-    if state is not None and state.get("attempted"):
-        if state.get("error"):
-            raise ValueError(state["error"])
-        return
-    if state is not None:
-        state["attempted"] = True
-    try:
-        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
-            client.settimeout(P4_SYNC_TIMEOUT_SECONDS)
-            client.connect(P4_SYNC_SOCKET)
-            client.sendall(b"sync\n")
-            with client.makefile("rb") as response:
-                result = json.loads(response.readline(16384))
-        if not result.get("ok"):
-            raise ValueError(result.get("error") or "P4 sync failed")
-    except Exception as exc:
-        error = "Repository sync failed; source was not searched: {}".format(exc)
-        if state is not None:
-            state["error"] = error
-        raise ValueError(error) from exc
-
-
-def is_within_root(path, root):
-    try:
-        common = os.path.commonpath([os.path.realpath(path), os.path.realpath(root)])
-    except ValueError:
-        return False
-    return common == os.path.realpath(root)
-
-
-def resolve_allowed_file(path):
-    require_file_search_enabled()
-    requested = str(path or "").strip()
-    if not requested:
-        raise ValueError("path is required")
-    candidates = []
-    if os.path.isabs(requested):
-        candidates.append(os.path.realpath(requested))
-    else:
-        for root in FILE_SEARCH_PATHS:
-            candidates.append(os.path.realpath(os.path.join(root, requested)))
-    for candidate in candidates:
-        if any(is_within_root(candidate, root) for root in FILE_SEARCH_PATHS) and os.path.isfile(candidate):
-            return candidate
-    raise ValueError("File is outside configured paths or does not exist.")
-
-
-def resolve_search_roots(subpath=None):
-    requested = str(subpath or "").strip()
-    if not requested:
-        return [root for root in FILE_SEARCH_PATHS if os.path.isdir(root)]
-    candidates = []
-    if os.path.isabs(requested):
-        candidates.append(os.path.realpath(requested))
-    else:
-        for root in FILE_SEARCH_PATHS:
-            candidates.append(os.path.realpath(os.path.join(root, requested)))
-    matched = [
-        candidate
-        for candidate in candidates
-        if any(is_within_root(candidate, root) for root in FILE_SEARCH_PATHS) and os.path.isdir(candidate)
-    ]
-    if not matched:
-        raise ValueError("Directory is outside configured paths or does not exist.")
-    return matched
-
-
-def relative_to_allowed_root(path):
-    for root in FILE_SEARCH_PATHS:
-        if is_within_root(path, root):
-            return os.path.relpath(path, root).replace("\\", "/")
-    return path
-
-
-def is_searchable_file(path):
-    try:
-        if os.path.getsize(path) > FILE_SEARCH_MAX_FILE_BYTES:
-            return False
-    except OSError:
-        return False
-    _, ext = os.path.splitext(path)
-    return ext.lower() in FILE_SEARCH_EXTENSIONS
-
-
-def read_text_file(path, max_bytes=FILE_SEARCH_MAX_FILE_BYTES):
-    with open(path, "rb") as handle:
-        raw = handle.read(max_bytes + 1)
-    if b"\x00" in raw:
-        raise ValueError("Binary file skipped.")
-    return raw[:max_bytes].decode("utf-8", errors="replace"), len(raw) > max_bytes
-
-
-def score_file_candidate(relative_path, terms, content_matched_terms=(), content_hits=0):
-    relative_lower = relative_path.lower()
-    filename_lower = os.path.basename(relative_lower)
-    stem_lower = os.path.splitext(filename_lower)[0]
-    matched_terms = set(content_matched_terms)
-    path_score = 0
-    for term in terms:
-        if term == stem_lower or term == filename_lower:
-            path_score += 80
-            matched_terms.add(term)
-        elif term in filename_lower:
-            path_score += 30
-            matched_terms.add(term)
-        elif term in relative_lower:
-            path_score += 8
-            matched_terms.add(term)
-    score = path_score + (len(matched_terms) * 25) + min(int(content_hits), 15) * 2
-    if score <= 0:
-        return 0
-    path_parts = [part for part in relative_lower.split("/") if part]
-    is_deferred_path = any(part in DEFERRED_HEAVY_DIRS for part in path_parts[:-1])
-    wants_deferred = any(term in DEFERRED_HEAVY_DIRS for term in terms)
-    if is_deferred_path and not wants_deferred:
-        score = max(1, int(score * 0.45))
-    return score
-
-
-def build_rg_globs():
-    globs = []
-    for skip in sorted(SKIP_DIRS):
-        globs.extend(["-g", "!{}/**".format(skip)])
-    for ext in sorted(FILE_SEARCH_EXTENSIONS):
-        globs.extend(["-g", "*{}".format(ext)])
-    return globs
-
-
-def search_files_with_rg(rg_bin, roots, terms):
-    globs = build_rg_globs()
-    max_size = str(FILE_SEARCH_MAX_FILE_BYTES)
-    candidates = {}
-
-    # 1. Fast filename/path pass via rg --files
-    files_cmd = [rg_bin, "--files", "--no-ignore", "--max-filesize", max_size] + globs + roots
-    proc_files = subprocess.run(files_cmd, capture_output=True, text=True, errors="replace", timeout=30)
-    for raw_line in proc_files.stdout.splitlines():
-        path = raw_line.strip()
-        if not path:
-            continue
-        rel = relative_to_allowed_root(path)
-        rel_lower = rel.lower()
-        if any(term in rel_lower for term in terms):
-            candidates[path] = {
-                "path": path,
-                "relative_path": rel,
-                "matched_terms": set(),
-                "hits": 0,
-                "snippets": [],
-            }
-
-    # 2. Fast content pass via rg --json -i -m 10
-    pattern = "|".join(re.escape(term) for term in terms if term)
-    if pattern:
-        match_cmd = [
-            rg_bin, "--json", "-i", "--no-ignore", "-m", "10",
-            "--max-filesize", max_size,
-        ] + globs + ["-e", pattern] + roots
-        proc_match = subprocess.run(match_cmd, capture_output=True, text=True, errors="replace", timeout=60)
-        for raw_line in proc_match.stdout.splitlines():
-            if not raw_line.startswith("{"):
-                continue
-            try:
-                event = json.loads(raw_line)
-            except json.JSONDecodeError:
-                continue
-            if event.get("type") != "match":
-                continue
-            data = event.get("data") or {}
-            path = (data.get("path") or {}).get("text")
-            line_text = ((data.get("lines") or {}).get("text") or "").rstrip("\r\n")
-            line_no = int(data.get("line_number") or 0)
-            if not path:
-                continue
-            entry = candidates.get(path)
-            if entry is None:
-                entry = {
-                    "path": path,
-                    "relative_path": relative_to_allowed_root(path),
-                    "matched_terms": set(),
-                    "hits": 0,
-                    "snippets": [],
-                }
-                candidates[path] = entry
-            entry["hits"] += 1
-            line_lower = line_text.lower()
-            for term in terms:
-                if term in line_lower:
-                    entry["matched_terms"].add(term)
-            if len(entry["snippets"]) < 3:
-                entry["snippets"].append(
-                    {
-                        "line": line_no,
-                        "text": line_text.strip()[:FILE_SEARCH_MAX_CHARS],
-                    }
-                )
-
-    results = []
-    for path, entry in candidates.items():
-        score = score_file_candidate(
-            entry["relative_path"],
-            terms,
-            entry["matched_terms"],
-            entry["hits"],
-        )
-        if score <= 0:
-            continue
-        snippets = entry["snippets"] or [{"line": 0, "text": "Path match"}]
-        results.append(
-            {
-                "path": path,
-                "relative_path": entry["relative_path"],
-                "score": score,
-                "truncated": False,
-                "snippets": snippets,
-            }
-        )
-    return results
-
-
-def search_files_with_walk(roots, terms):
-    results = []
-    for root in roots:
-        if not os.path.isdir(root):
-            continue
-        for current_root, dirnames, filenames in os.walk(root):
-            dirnames[:] = [name for name in dirnames if name not in SKIP_DIRS]
-            for filename in filenames:
-                path = os.path.join(current_root, filename)
-                if not is_searchable_file(path):
-                    continue
-                relative_path = relative_to_allowed_root(path)
-                try:
-                    text, truncated = read_text_file(path)
-                except (OSError, ValueError):
-                    continue
-                lowered = text.lower()
-                matched_terms = {term for term in terms if term in lowered}
-                hits = sum(min(lowered.count(term), 10) for term in matched_terms)
-                score = score_file_candidate(relative_path, terms, matched_terms, hits)
-                if score <= 0:
-                    continue
-                snippets = []
-                for line_number, line in enumerate(text.splitlines(), start=1):
-                    line_lower = line.lower()
-                    if any(term in line_lower for term in terms):
-                        snippets.append(
-                            {
-                                "line": line_number,
-                                "text": line.strip()[:FILE_SEARCH_MAX_CHARS],
-                            }
-                        )
-                    if len(snippets) >= 3:
-                        break
-                if not snippets:
-                    snippets.append({"line": 0, "text": "Path match"})
-                results.append(
-                    {
-                        "path": path,
-                        "relative_path": relative_path,
-                        "score": score,
-                        "truncated": truncated,
-                        "snippets": snippets,
-                    }
-                )
-    return results
-
-
-def split_primary_and_deferred_roots(roots):
-    primary = []
-    deferred = []
-    for root in roots:
-        if not os.path.isdir(root):
-            continue
+    def work():
         try:
-            children = sorted(os.listdir(root))
-        except OSError:
-            primary.append(root)
-            continue
-        has_deferred = any(
-            name.lower() in DEFERRED_HEAVY_DIRS and os.path.isdir(os.path.join(root, name))
-            for name in children
-        )
-        if not has_deferred:
-            primary.append(root)
-            continue
-        for name in children:
-            if name in SKIP_DIRS:
-                continue
-            full = os.path.join(root, name)
-            if name.lower() in DEFERRED_HEAVY_DIRS and os.path.isdir(full):
-                deferred.append(full)
-            else:
-                primary.append(full)
-    return primary, deferred
+            conn.request(method, path, body=body, headers=headers)
+            box["resp"] = conn.getresponse()
+        except BaseException as exc:  # reported to the waiting thread
+            box["error"] = exc
+
+    worker = threading.Thread(target=work, daemon=True)
+    worker.start()
+    while worker.is_alive():
+        worker.join(1.0)
+        if worker.is_alive() and client_sock is not None and client_closed(client_sock):
+            conn.close()
+            raise ClientGone()
+    if "error" in box:
+        conn.close()
+        raise UpstreamError(str(box["error"]) or type(box["error"]).__name__)
+    return conn, box["resp"]
 
 
-def run_search_backend(roots, terms):
-    if not roots:
-        return []
-    rg_bin = shutil.which("rg")
-    if rg_bin:
-        try:
-            return search_files_with_rg(rg_bin, roots, terms)
-        except Exception:
-            pass
-    return search_files_with_walk(roots, terms)
+def upstream_headers(handler, listener, extra=None):
+    """Headers for the scheduler: the caller's, minus hop-by-hop, plus identity."""
+    headers = {k: v for k, v in handler.headers.items()
+               if k.lower() not in HOP_BY_HOP and k.lower() not in GATEWAY_ONLY_HEADERS
+               and k.lower() not in {"x-forwarded-for", "accept-encoding"}}
+    # The scheduler sees the gateway as its client; hand it the real address for its IP rules.
+    headers["X-Forwarded-For"] = handler.client_address[0]
+    if listener["priority"]:
+        headers["X-LLM-Priority"] = listener["priority"]
+    if listener["caller"]:
+        headers["X-Caller"] = listener["caller"]
+    headers.update(extra or {})
+    return headers
 
 
-def tool_search_files(arguments):
-    require_file_search_enabled()
-    query = str(arguments.get("query") or "").strip()
-    if not query:
-        raise ValueError("query is required")
-    limit = max(1, min(int(arguments.get("limit") or FILE_SEARCH_RESULT_LIMIT), FILE_SEARCH_RESULT_LIMIT))
-    explicit_path = str(arguments.get("path") or "").strip()
-    roots = resolve_search_roots(explicit_path)
-    terms = extract_search_terms(query)
-    wants_heavy = bool(explicit_path) or any(term in DEFERRED_HEAVY_DIRS for term in terms)
-    if wants_heavy:
-        results = run_search_backend(roots, terms)
-    else:
-        primary_roots, deferred_roots = split_primary_and_deferred_roots(roots)
-        results = run_search_backend(primary_roots, terms)
-        if len(results) < limit and deferred_roots:
-            results.extend(run_search_backend(deferred_roots, terms))
-    results.sort(key=lambda item: (item["score"], -len(item["relative_path"])), reverse=True)
-    return {
-        "query": query,
-        "terms": terms,
-        "roots": roots,
-        "results": results[:limit],
-    }
+# --------------------------------------------------------------------------------------
+# Tool service
+# --------------------------------------------------------------------------------------
 
+class ToolRegistry:
+    def __init__(self, url, cache_seconds):
+        self.url, self.cache_seconds = url, cache_seconds
+        self.lock = threading.Lock()
+        self.tools_cache, self.fetched, self.failing = [], 0.0, False
 
-def tool_list_files(arguments):
-    require_file_search_enabled()
-    explicit_path = str(arguments.get("path") or "").strip()
-    roots = resolve_search_roots(explicit_path)
-    pattern = str(arguments.get("pattern") or "").strip().lower()
-    limit = max(1, min(int(arguments.get("limit") or 30), 100))
-    entries = []
-    if not pattern:
-        # List immediate children of the requested directory/roots
-        for root in roots:
+    def tools(self):
+        if not self.url:
+            return []
+        with self.lock:
+            if time.monotonic() - self.fetched < self.cache_seconds:
+                return list(self.tools_cache)
             try:
-                names = sorted(os.listdir(root))
-            except OSError:
-                continue
-            for name in names:
-                if name in SKIP_DIRS:
-                    continue
-                full = os.path.join(root, name)
-                rel = relative_to_allowed_root(full)
-                entries.append(
-                    {
-                        "path": rel + ("/" if os.path.isdir(full) else ""),
-                        "type": "dir" if os.path.isdir(full) else "file",
-                    }
-                )
-                if len(entries) >= limit:
-                    break
-        return {"roots": roots, "pattern": pattern, "entries": entries[:limit]}
+                with urllib.request.build_opener(urllib.request.ProxyHandler({})).open(
+                        self.url + "/tools", timeout=HTTP_TIMEOUT_SECONDS) as response:
+                    data = json.loads(response.read().decode("utf-8", errors="replace"))
+                self.tools_cache = [t for t in data.get("tools") or []
+                                    if t.get("type") == "function" and (t.get("function") or {}).get("name")]
+                self.failing = False
+            except (OSError, ValueError, urllib.error.URLError) as exc:
+                if not self.failing:
+                    log("tool-service unavailable, serving without gateway tools: {}".format(exc))
+                self.failing = True
+                self.tools_cache = []
+            self.fetched = time.monotonic()
+            return list(self.tools_cache)
 
-    rg_bin = shutil.which("rg")
-    if rg_bin and roots:
-        globs = build_rg_globs()
-        wants_heavy = bool(explicit_path) or any(heavy in pattern for heavy in DEFERRED_HEAVY_DIRS)
-        search_batches = [roots] if wants_heavy else list(split_primary_and_deferred_roots(roots))
-        matched = []
-        for batch in search_batches:
-            if not batch:
-                continue
-            cmd = [rg_bin, "--files", "--no-ignore"] + globs + batch
-            proc = subprocess.run(cmd, capture_output=True, text=True, errors="replace", timeout=30)
-            for raw_line in proc.stdout.splitlines():
-                full = raw_line.strip()
-                if not full:
-                    continue
-                rel = relative_to_allowed_root(full)
-                if pattern in rel.lower():
-                    matched.append(rel)
-            if len(matched) >= limit:
-                break
-        matched.sort(
-            key=lambda rel: (
-                any(part in DEFERRED_HEAVY_DIRS for part in rel.lower().split("/")[:-1]),
-                len(rel),
-                rel,
-            )
-        )
-        return {
-            "roots": roots,
-            "pattern": pattern,
-            "entries": [{"path": rel, "type": "file"} for rel in matched[:limit]],
-        }
-
-    for root in roots:
-        for current_root, dirnames, filenames in os.walk(root):
-            dirnames[:] = [name for name in dirnames if name not in SKIP_DIRS]
-            for filename in filenames:
-                full = os.path.join(current_root, filename)
-                rel = relative_to_allowed_root(full)
-                if pattern in rel.lower():
-                    entries.append({"path": rel, "type": "file"})
-                    if len(entries) >= limit:
-                        return {"roots": roots, "pattern": pattern, "entries": entries}
-    return {"roots": roots, "pattern": pattern, "entries": entries}
+    def call(self, name, arguments, chat_id):
+        body = json.dumps({"name": name, "arguments": arguments}, ensure_ascii=False).encode("utf-8")
+        request = urllib.request.Request(
+            self.url + "/call", data=body, method="POST",
+            headers={"Content-Type": "application/json; charset=utf-8", "X-Chat-Id": chat_id})
+        try:
+            with urllib.request.build_opener(urllib.request.ProxyHandler({})).open(
+                    request, timeout=TOOL_TIMEOUT_SECONDS) as response:
+                return json.loads(response.read().decode("utf-8", errors="replace"))
+        except (OSError, ValueError, urllib.error.URLError) as exc:
+            return {"ok": False, "error": "tool service failed: {}".format(exc)}
 
 
-def tool_read_file_excerpt(arguments):
-    path = resolve_allowed_file(arguments.get("path"))
-    start_line = max(1, int(arguments.get("start_line") or 1))
-    max_lines = max(1, min(int(arguments.get("max_lines") or FILE_READ_MAX_LINES), FILE_READ_MAX_LINES))
-    text, truncated = read_text_file(path)
-    lines = text.splitlines()
-    start_index = min(start_line - 1, len(lines))
-    selected = lines[start_index : start_index + max_lines]
-    return {
-        "path": path,
-        "relative_path": relative_to_allowed_root(path),
-        "start_line": start_index + 1 if lines else 1,
-        "end_line": start_index + len(selected),
-        "truncated": truncated,
-        "text": "\n".join(selected),
-    }
+REGISTRY = ToolRegistry(TOOL_SERVICE_URL, TOOL_CACHE_SECONDS)
 
 
-TOOLS = [
-    {
-        "type": "function",
-        "function": {
-            "name": "search_web",
-            "description": "Search the public web with SearXNG and return result titles, URLs, and snippets.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "query": {"type": "string", "description": "Search query."},
-                    "limit": {"type": "integer", "description": "Maximum result count, 1-5."},
-                },
-                "required": ["query"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "fetch_url",
-            "description": "Fetch readable text from a public http/https URL. Private, loopback, and link-local hosts are blocked.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "url": {"type": "string", "description": "Public URL to read."},
-                },
-                "required": ["url"],
-            },
-        },
-    },
-]
-
-TOOL_HANDLERS = {
-    "search_web": tool_search_web,
-    "fetch_url": tool_fetch_url,
-}
-
-if not WEB_TOOLS_ENABLED:
-    TOOLS = [tool for tool in TOOLS if tool.get("function", {}).get("name") not in {"search_web", "fetch_url"}]
-    TOOL_HANDLERS.pop("search_web", None)
-    TOOL_HANDLERS.pop("fetch_url", None)
-elif not FETCH_URL_ENABLED:
-    TOOLS = [tool for tool in TOOLS if tool.get("function", {}).get("name") != "fetch_url"]
-    TOOL_HANDLERS.pop("fetch_url", None)
-
-if FILE_TOOLS_ENABLED:
-    TOOLS.extend(
-        [
-            {
-                "type": "function",
-                "function": {
-                    "name": "list_files",
-                    "description": "List directories or find files by filename substring under configured local read-only file paths.",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "path": {"type": "string", "description": "Optional subdirectory relative to a configured root (e.g. 'src/core')."},
-                            "pattern": {"type": "string", "description": "Optional filename/path substring filter."},
-                            "limit": {"type": "integer", "description": "Maximum result count."},
-                        },
-                    },
-                },
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "search_files",
-                    "description": "Search configured local read-only file paths and return matching files with short line snippets.",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "query": {"type": "string", "description": "Concise identifier, symbol, or keyword query."},
-                            "path": {"type": "string", "description": "Optional subdirectory relative to a configured root (e.g. 'src')."},
-                            "limit": {"type": "integer", "description": "Maximum result count."},
-                        },
-                        "required": ["query"],
-                    },
-                },
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "read_file_excerpt",
-                    "description": "Read a small line range from a file under configured local read-only file paths.",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "path": {"type": "string", "description": "Absolute path or path relative to a configured root."},
-                            "start_line": {"type": "integer", "description": "1-based start line."},
-                            "max_lines": {"type": "integer", "description": "Maximum lines to read."},
-                        },
-                        "required": ["path"],
-                    },
-                },
-            },
-        ]
-    )
-    TOOL_HANDLERS.update(
-        {
-            "list_files": tool_list_files,
-            "search_files": tool_search_files,
-            "read_file_excerpt": tool_read_file_excerpt,
-        }
-    )
-
-
-def parse_tool_arguments(value):
-    if isinstance(value, dict):
-        return value
-    if not value:
-        return {}
-    return json.loads(value)
-
-
-def normalize_text_tool_call(data, index):
-    if not isinstance(data, dict):
-        return None
-    function = data.get("function") if isinstance(data.get("function"), dict) else data
-    name = function.get("name")
-    if name not in TOOL_HANDLERS:
-        return None
-    arguments = function.get("arguments") or {}
-    if isinstance(arguments, str):
-        argument_text = arguments
-    else:
-        argument_text = json.dumps(arguments, ensure_ascii=False)
-    return {
-        "id": "text-tool-call-{}".format(index),
-        "type": "function",
-        "function": {
+def run_tool_calls(calls, chat_id):
+    """Execute the model's gateway-owned calls; returns the `tool` messages to append."""
+    messages = []
+    for call in calls:
+        function = call.get("function") or {}
+        name = function.get("name") or ""
+        started = now_ms()
+        try:
+            text = function.get("arguments")
+            arguments = text if isinstance(text, dict) else (json.loads(text) if text else {})
+            result = REGISTRY.call(name, arguments, chat_id)
+        except ValueError as exc:
+            result = {"ok": False, "error": "invalid tool arguments: {}".format(exc)}
+        log("tool {} {} {}ms".format(name, "ok" if result.get("ok") else "failed", now_ms() - started))
+        messages.append({
+            "role": "tool",
+            "tool_call_id": call.get("id", ""),
             "name": name,
-            "arguments": argument_text,
-        },
-    }
+            "content": json.dumps(result, ensure_ascii=False),
+        })
+    return messages
 
 
-def parse_text_tool_calls(content):
-    if not isinstance(content, str) or "<tool_call>" not in content:
-        return []
-    calls = []
-    matches = re.findall(r"<tool_call>\s*(.*?)\s*</tool_call>", content, flags=re.DOTALL)
-    for index, raw in enumerate(matches):
-        try:
-            parsed = json.loads(raw)
-        except json.JSONDecodeError:
-            continue
-        call = normalize_text_tool_call(parsed, index)
-        if call:
-            calls.append(call)
-    return calls
-
-
-def run_tool_call(tool_call):
-    function = tool_call.get("function") or {}
-    name = function.get("name") or ""
-    arguments = parse_tool_arguments(function.get("arguments"))
-    handler = TOOL_HANDLERS.get(name)
-    if not handler:
-        raise ValueError("Unknown tool: {}".format(name))
-    return handler(arguments)
-
-
-def is_meta_task_prompt(text):
-    stripped = (text or "").lstrip()
-    return stripped.startswith("### Task:")
-
-
-def with_gateway_tools(payload):
-    payload = dict(payload)
-    payload.setdefault("model", DEFAULT_MODEL)
-    payload["stream"] = False
-    payload.setdefault("chat_template_kwargs", {"enable_thinking": False})
-    messages = list(payload.get("messages") or [])
-    if is_meta_task_prompt(last_user_text(messages)):
-        payload["messages"] = messages
-        return payload
-    client_tools = payload.get("tools") or []
-    payload["tools"] = TOOLS + [tool for tool in client_tools if tool.get("type") == "function"]
-    payload.setdefault("tool_choice", "auto")
-    messages.insert(0, {"role": "system", "content": SYSTEM_TOOL_HINT})
-    add_auto_file_context(messages)
-    add_auto_search_context(messages)
-    payload["messages"] = messages
-    return payload
-
+# --------------------------------------------------------------------------------------
+# Request shaping
+# --------------------------------------------------------------------------------------
 
 def last_user_text(messages):
     for message in reversed(messages):
@@ -1029,183 +247,145 @@ def last_user_text(messages):
     return ""
 
 
-def should_auto_search(text):
-    if is_meta_task_prompt(text):
+def is_meta_task_prompt(text):
+    stripped = (text or "").lstrip()
+    return stripped.startswith("### Task:")
+
+
+def tools_wanted(payload, headers):
+    """Whether this request may be given the gateway's tools."""
+    if not TOOLS_ENABLED or not TOOL_SERVICE_URL:
         return False
-    if WEB_SEARCH_POLICY == "off":
+    if str(headers.get("X-Agent-Tools", "")).strip().lower() in {"off", "0", "false", "no"}:
         return False
-    if WEB_SEARCH_POLICY == "always":
-        return True
-    lowered = (text or "").lower()
-    if should_auto_file_search(text) and not any(word in lowered for word in ("웹", "인터넷", "web", "뉴스")):
+    if payload.get("tool_choice") not in (None, "auto"):
         return False
-    if "local file" in lowered and "only" in lowered:
-        return False
-    if WEB_SEARCH_POLICY == "question" and ("?" in lowered or "what" in lowered or "how" in lowered or "why" in lowered):
-        return True
-    triggers = [
-        "web",
-        "search",
-        "latest",
-        "current",
-        "today",
-        "recent",
-        "웹",
-        "검색",
-        "최신",
-        "현재",
-        "오늘",
-        "최근",
-        "뉴스",
-        "주가",
-        "시세",
-        "가격",
-        "증시",
-        "코스피",
-        "코스닥",
-        "삼성전자",
-        "삼전",
-        "환율",
-        "달러",
-        "원화",
-        "얼마",
-    ]
-    return any(trigger in lowered for trigger in triggers)
+    return not is_meta_task_prompt(last_user_text(payload.get("messages") or []))
 
 
-def add_auto_search_context(messages):
-    query = last_user_text(messages)
-    if not should_auto_search(query):
-        return
-    try:
-        result = tool_search_web({"query": query, "limit": SEARCH_RESULT_LIMIT})
-        messages.append(
-            {
-                "role": "system",
-                "content": "Auto web search results:\n{}".format(json.dumps(result, ensure_ascii=False)),
-            }
-        )
-    except Exception as exc:
-        messages.append(
-            {
-                "role": "system",
-                "content": "Auto web search failed: {}".format(exc),
-            }
-        )
-
-
-def extract_requested_line_count(text):
-    matches = [
-        r"first\s+(\d+)\s+lines?",
-        r"(\d+)\s+lines?",
-    ]
-    for pattern in matches:
-        match = re.search(pattern, text or "", flags=re.IGNORECASE)
-        if match:
-            return max(1, min(int(match.group(1)), FILE_READ_MAX_LINES))
-    return min(80, FILE_READ_MAX_LINES)
-
-
-def extract_local_file_paths(text):
-    candidates = []
-    patterns = [
-        r"(?:/knowledge/)?[A-Za-z0-9_.-]+(?:[\\/][A-Za-z0-9_.-]+)+\.[A-Za-z0-9_.+-]+",
-        r"[A-Za-z0-9_.-]+(?:[\\/][A-Za-z0-9_.-]+)+",
-    ]
-    for pattern in patterns:
-        for match in re.finditer(pattern, text or ""):
-            candidate = match.group(0).strip("`'\".,:;()[]{}")
-            if candidate and candidate not in candidates:
-                candidates.append(candidate)
-    return candidates
-
-
-def should_auto_file_search(text):
-    if is_meta_task_prompt(text):
-        return False
-    if not FILE_TOOLS_ENABLED:
-        return False
-    if FILE_SEARCH_POLICY == "always":
-        return True
-    lowered = (text or "").lower()
-    triggers = [
-        "local file",
-        "local files",
-        "search_files",
-        "read_file_excerpt",
-        "find ",
-        "search ",
-        "read ",
-        "file path",
-        "snippet",
-        "저장소", "퍼포스", "로컬 파일", "로컬파일", "소스", "코드",
-        "함수", "클래스", "구현", "파일에서", "파일을", "파일 내용",
-        "repository", "perforce", "source code",
-    ]
-    return any(trigger in lowered for trigger in triggers)
-
-
-def add_auto_file_context(messages):
-    query = last_user_text(messages)
-    if not should_auto_file_search(query):
-        return
-    paths = extract_local_file_paths(query)
-    try:
-        if paths:
-            excerpts = []
-            max_lines = extract_requested_line_count(query)
-            for path in paths[:FILE_SEARCH_RESULT_LIMIT]:
-                excerpts.append(
-                    tool_read_file_excerpt(
-                        {
-                            "path": path,
-                            "start_line": 1,
-                            "max_lines": max_lines,
-                        }
-                    )
-                )
-            content = "Auto local file excerpts:\n{}".format(json.dumps(excerpts, ensure_ascii=False))
+def normalize_messages(messages):
+    # Qwen templates permit a single system message at the beginning.
+    # Keep conversation/tool ordering and preserve structured content parts.
+    systems = []
+    conversation = []
+    for message in messages or []:
+        if message.get("role") == "system":
+            systems.append(message.get("content") or "")
         else:
-            result = tool_search_files({"query": query, "limit": FILE_SEARCH_RESULT_LIMIT})
-            content = "Auto local file search results:\n{}".format(json.dumps(result, ensure_ascii=False))
-        messages.append({"role": "system", "content": content})
-    except Exception as exc:
-        messages.append(
-            {
-                "role": "system",
-                "content": "Auto local file context failed: {}".format(exc),
-            }
-        )
+            conversation.append(message)
+    if systems:
+        if all(isinstance(content, str) for content in systems):
+            content = "\n\n".join(systems)
+        else:
+            content = []
+            for part in systems:
+                if content:
+                    content.append({"type": "text", "text": "\n\n"})
+                content.extend(part if isinstance(part, list) else [{"type": "text", "text": part}])
+        conversation.insert(0, {"role": "system", "content": content})
+    return conversation
 
 
-def append_tool_results(messages, response):
-    message = response.get("choices", [{}])[0].get("message", {})
-    tool_calls = message.get("tool_calls") or []
-    if not tool_calls:
-        tool_calls = parse_text_tool_calls(message.get("content"))
-        if not tool_calls:
-            return False
-        message = {"role": "assistant", "content": "", "tool_calls": tool_calls}
-    messages.append(message)
-    for tool_call in tool_calls:
+def build_upstream_payload(payload, messages, listener, gateway_tools, limit_reached, stream):
+    up = dict(payload)
+    up["messages"] = normalize_messages(messages)
+    up["stream"] = stream
+    for key, value in listener["defaults"].items():
+        up.setdefault(key, value)
+    up.setdefault("model", DEFAULT_MODEL)
+    client_tools = list(payload.get("tools") or [])
+    if gateway_tools:
+        declared = {(t.get("function") or {}).get("name") for t in client_tools}
+        up["tools"] = client_tools + [t for t in gateway_tools if t["function"]["name"] not in declared]
+        up.setdefault("tool_choice", "auto")
+    elif limit_reached and not client_tools:
+        up.pop("tools", None)
+        up["tool_choice"] = "none"
+    return up
+
+
+def new_call_id():
+    return "call_{}".format(uuid.uuid4().hex[:24])
+
+
+# --------------------------------------------------------------------------------------
+# Client output
+# --------------------------------------------------------------------------------------
+
+def encode_json(payload):
+    return json.dumps(payload, ensure_ascii=False).encode("utf-8")
+
+
+class Sink:
+    """What the caller sees: one JSON body, or one SSE stream that may span several rounds."""
+
+    def __init__(self, handler):
+        self.handler = handler
+        self.started = False
+        self.finished = False
+
+    def _write(self, data):
         try:
-            result = run_tool_call(tool_call)
-            content = json.dumps({"ok": True, "result": result}, ensure_ascii=False)
-        except Exception as exc:
-            content = json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False)
-        messages.append(
-            {
-                "role": "tool",
-                "tool_call_id": tool_call.get("id", ""),
-                "name": (tool_call.get("function") or {}).get("name", ""),
-                "content": content,
-            }
-        )
-    return True
+            self.handler.wfile.write(data)
+            self.handler.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
+            self.handler.close_connection = True
+            raise ClientGone()
+
+    def json(self, status, body, content_type="application/json; charset=utf-8"):
+        raw = body if isinstance(body, bytes) else encode_json(body)
+        try:
+            self.handler.send_response(status)
+            self.handler.send_header("Content-Type", content_type)
+            self.handler.send_header("Content-Length", str(len(raw)))
+            self.handler.end_headers()
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
+            self.handler.close_connection = True
+            raise ClientGone()
+        self._write(raw)
+        self.started = self.finished = True
+
+    def start_stream(self):
+        if self.started:
+            return
+        try:
+            self.handler.send_response(200)
+            self.handler.send_header("Content-Type", "text/event-stream; charset=utf-8")
+            self.handler.send_header("Cache-Control", "no-cache")
+            self.handler.send_header("Connection", "close")
+            self.handler.end_headers()
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
+            self.handler.close_connection = True
+            raise ClientGone()
+        self.handler.close_connection = True
+        self.started = True
+
+    def event(self, raw):
+        self.start_stream()
+        self._write(raw)
+
+    def comment(self, text):
+        """SSE comment: keeps idle proxies from timing out while a tool runs."""
+        if self.started and not self.finished:
+            self._write(": {}\n\n".format(text).encode("utf-8"))
+
+    def finish(self):
+        if self.finished:
+            return
+        self.start_stream()
+        self._write(b"data: [DONE]\n\n")
+        self.finished = True
 
 
-class EmptyCompletionError(RuntimeError):
-    """Upstream answered, but with nothing in it."""
+# --------------------------------------------------------------------------------------
+# One round against the model
+# --------------------------------------------------------------------------------------
+
+class Outcome:
+    """`calls` is None when the reply was delivered to the caller, else the gateway calls to run."""
+
+    def __init__(self, calls=None, assistant=None):
+        self.calls, self.assistant = calls, assistant
 
 
 def assert_non_empty(response):
@@ -1223,122 +403,364 @@ def assert_non_empty(response):
     )
 
 
-def request_chat(payload):
-    # Qwen templates permit a single system message at the beginning.
-    # Keep conversation/tool ordering and preserve structured content parts.
-    systems = []
-    conversation = []
-    for message in payload.get("messages") or []:
-        if message.get("role") == "system":
-            systems.append(message.get("content") or "")
-        else:
-            conversation.append(message)
-    if systems:
-        if all(isinstance(content, str) for content in systems):
-            content = "\n\n".join(systems)
-        else:
-            content = []
-            for part in systems:
-                if content:
-                    content.append({"type": "text", "text": "\n\n"})
-                content.extend(part if isinstance(part, list) else [{"type": "text", "text": part}])
-        conversation.insert(0, {"role": "system", "content": content})
-    normalized = dict(payload, messages=conversation)
-    # Generation is not idempotent: a timed-out request may still be running.
-    # Wait for long prefills/completions without submitting duplicate work.
-    return request_json(
-        UPSTREAM_BASE_URL + "/chat/completions", normalized,
-        timeout=LLM_TIMEOUT_SECONDS, retries=0,
-    )
+def post_chat(handler, listener, up):
+    body = encode_json(up)
+    headers = upstream_headers(handler, listener, {"Content-Type": "application/json; charset=utf-8"})
+    return open_upstream("POST", UPSTREAM_PREFIX + "/chat/completions", body, headers,
+                         LLM_TIMEOUT_SECONDS, handler.connection)
 
 
-def chat_completions(payload):
-    token = FILE_SYNC_STATE.set({})
+def plain_round(handler, listener, up, active, sink):
+    conn, resp = post_chat(handler, listener, up)
     try:
-        return _chat_completions(payload)
+        raw = resp.read()
+        status = resp.status
+        content_type = resp.getheader("Content-Type") or "application/json; charset=utf-8"
     finally:
-        FILE_SYNC_STATE.reset(token)
+        conn.close()
+    if status != 200:
+        sink.json(status, raw, content_type)
+        return Outcome()
+    try:
+        response = json.loads(raw)
+    except ValueError:
+        sink.json(200, raw, content_type)
+        return Outcome()
+    assert_non_empty(response)
+    message = ((response.get("choices") or [{}])[0]).get("message") or {}
+    calls = message.get("tool_calls") or []
+    owned = [c for c in calls if (c.get("function") or {}).get("name") in active]
+    if owned and len(owned) == len(calls):
+        for call in calls:
+            call.setdefault("id", new_call_id())
+        return Outcome(calls, message)
+    sink.json(200, raw, content_type)
+    return Outcome()
 
 
-def _chat_completions(payload):
-    agent_payload = with_gateway_tools(payload)
-    agent_payload["stream"] = False
-    messages = agent_payload["messages"]
-    for _ in range(MAX_TOOL_ROUNDS):
-        response = request_chat(agent_payload)
-        if not append_tool_results(messages, response):
-            return response
-    agent_payload.pop("tools", None)
-    agent_payload["tool_choice"] = "none"
-    messages.append(
-        {
-            "role": "system",
-            "content": "Tool round limit reached. Answer with the evidence already collected.",
-        }
-    )
-    return request_chat(agent_payload)
+def iter_sse(resp):
+    """Yield (raw event bytes, data text) for each server-sent event."""
+    lines = []
+    while True:
+        line = resp.readline()
+        if not line:
+            if lines:
+                yield b"".join(lines), _event_data(lines)
+            return
+        if line in (b"\n", b"\r\n"):
+            if lines:
+                yield b"".join(lines) + b"\n", _event_data(lines)
+                lines = []
+            continue
+        lines.append(line)
+
+
+def _event_data(lines):
+    parts = []
+    for line in lines:
+        if line.startswith(b"data:"):
+            parts.append(line[5:].strip().decode("utf-8", errors="replace"))
+    return "\n".join(parts) if parts else None
+
+
+class StreamState:
+    def __init__(self):
+        self.owner = {}      # tool call index -> True when the gateway runs it
+        self.calls = {}      # index -> accumulated gateway call
+        self.foreign = False
+        self.content = ""
+        self.has_output = False
+        self.pending = []    # role-only chunks held back until the reply shows what it is
+
+    def has_gateway_calls(self):
+        return bool(self.calls)
+
+
+def stream_round(handler, listener, up, active, sink):
+    conn, resp = post_chat(handler, listener, up)
+    state = StreamState()
+    try:
+        if resp.status != 200:
+            sink.json(resp.status, resp.read(), resp.getheader("Content-Type") or "application/json; charset=utf-8")
+            return Outcome()
+        for raw, data in iter_sse(resp):
+            if data is None:
+                continue  # comment / keep-alive from upstream
+            if data == "[DONE]":
+                break
+            try:
+                chunk = json.loads(data)
+            except ValueError:
+                _flush(sink, state)
+                sink.event(raw)
+                state.has_output = True
+                continue
+            _handle_chunk(sink, state, active, chunk, raw)
+    finally:
+        conn.close()
+
+    if state.calls and state.foreign:
+        log("model mixed gateway and client tool calls in one reply; gateway calls dropped")
+    if state.calls and not state.foreign:
+        calls = []
+        for index in sorted(state.calls):
+            call = state.calls[index]
+            calls.append({
+                "id": call["id"] or new_call_id(), "type": "function",
+                "function": {"name": call["name"], "arguments": call["arguments"] or "{}"},
+            })
+        return Outcome(calls, {"role": "assistant", "content": state.content, "tool_calls": calls})
+    if not state.has_output and not sink.started:
+        raise EmptyCompletionError(
+            "upstream returned an empty completion; check the GPU with nvidia-smi "
+            "and 'journalctl -k -b 0 | grep Xid' before retrying"
+        )
+    _flush(sink, state)
+    sink.finish()
+    return Outcome()
+
+
+def _flush(sink, state):
+    for raw in state.pending:
+        sink.event(raw)
+    state.pending = []
+
+
+def _handle_chunk(sink, state, active, chunk, raw):
+    choices = chunk.get("choices") or []
+    if not choices:
+        # Usage-only chunk. Usage of a round that ends in a gateway tool call is not the caller's.
+        if not state.has_gateway_calls():
+            _flush(sink, state)
+            sink.event(raw)
+        return
+    choice = choices[0]
+    delta = choice.get("delta") or {}
+
+    foreign = []
+    owned = False
+    for call in delta.get("tool_calls") or []:
+        index = call.get("index", 0)
+        function = call.get("function") or {}
+        name = function.get("name")
+        if index not in state.owner:
+            state.owner[index] = bool(name) and name in active
+            if state.owner[index]:
+                state.calls[index] = {"id": "", "name": name, "arguments": ""}
+        if state.owner[index]:
+            owned = True
+            entry = state.calls[index]
+            entry["id"] = call.get("id") or entry["id"]
+            entry["arguments"] += function.get("arguments") or ""
+        else:
+            foreign.append(call)
+            state.foreign = True
+            state.has_output = True
+
+    text = delta.get("content") or ""
+    reasoning = delta.get("reasoning_content") or delta.get("reasoning") or ""
+    if text:
+        state.content += text
+        if text.strip():
+            state.has_output = True
+    finish = choice.get("finish_reason")
+    # The finish chunk is a separate chunk without tool_calls, so judge by the round so far.
+    withhold_finish = bool(finish) and state.has_gateway_calls() and not state.foreign
+
+    nothing_yet = not (text or reasoning or foreign or owned) and not state.has_output and not sink.started
+    if not (text or reasoning or foreign or finish or owned) or (finish and nothing_yet and not state.has_gateway_calls()):
+        # Role-only / empty delta, or a finish with no output before it: held back so that an
+        # empty completion can still be refused with a 502 instead of a blank 200 stream.
+        if not sink.started:
+            state.pending.append(raw)
+        return
+    if owned or withhold_finish:
+        # Rebuild the chunk without the gateway's own tool calls and without a tool-call finish.
+        cleaned = {k: v for k, v in delta.items() if k != "tool_calls"}
+        if foreign:
+            cleaned["tool_calls"] = foreign
+        choice = dict(choice, delta=cleaned)
+        if withhold_finish:
+            choice["finish_reason"] = None
+        chunk = dict(chunk, choices=[choice] + list(choices[1:]))
+        raw = "data: {}\n\n".format(json.dumps(chunk, ensure_ascii=False)).encode("utf-8")
+        if not (text or reasoning or foreign):
+            return
+    _flush(sink, state)
+    sink.event(raw)
+
+
+def run_chat(handler, listener, payload, sink):
+    wants_stream = bool(payload.get("stream"))
+    gateway_tools = REGISTRY.tools() if tools_wanted(payload, handler.headers) else []
+    chat_id = uuid.uuid4().hex
+    messages = list(payload.get("messages") or [])
+    rounds = 0
+    for round_no in range(MAX_TOOL_ROUNDS + 1):
+        limit_reached = bool(gateway_tools) and round_no == MAX_TOOL_ROUNDS
+        tools_now = [] if limit_reached else gateway_tools
+        active = {t["function"]["name"] for t in tools_now}
+        if limit_reached:
+            messages.append({
+                "role": "system",
+                "content": "Tool round limit reached. Answer with the evidence already collected.",
+            })
+        up = build_upstream_payload(payload, messages, listener, tools_now, limit_reached, wants_stream)
+        outcome = (stream_round if wants_stream else plain_round)(handler, listener, up, active, sink)
+        if outcome.calls is None:
+            if rounds:
+                log("chat {} answered after {} tool round(s)".format(chat_id[:8], rounds))
+            return
+        rounds += 1
+        messages.append(outcome.assistant)
+        sink.comment("running tools")
+        messages.extend(run_tool_calls(outcome.calls, chat_id))
+
+
+# --------------------------------------------------------------------------------------
+# HTTP server
+# --------------------------------------------------------------------------------------
+
+def fallback_models_response():
+    return {
+        "object": "list",
+        "data": [{"id": DEFAULT_MODEL, "object": "model", "created": 0, "owned_by": "local-llm-agent-gateway"}],
+    }
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "local-llm-agent-gateway/1.0"
+    server_version = "local-llm-agent-gateway/2.0"
+    listener = None
 
     def log_message(self, fmt, *args):
-        print("{} - {}".format(self.address_string(), fmt % args), flush=True)
+        log("{} - {}".format(self.address_string(), fmt % args))
 
-    def do_GET(self):
+    # ---- routing -------------------------------------------------------------------
+    def _route(self):
         path = urllib.parse.urlparse(self.path).path.rstrip("/") or "/"
-        if path == "/health":
-            json_response(
-                self,
-                200,
-                {
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+            if length > MAX_BODY_BYTES:
+                return Sink(self).json(413, {"error": "request body too large"})
+            body = self.rfile.read(length) if length else b""
+            if self.command == "GET" and path == "/health":
+                return Sink(self).json(200, {
                     "ok": True,
                     "upstream_base_url": UPSTREAM_BASE_URL,
-                    "searxng_url": SEARXNG_URL,
-                },
-            )
-            return
-        if path == "/v1/models":
+                    "tool_service_url": TOOL_SERVICE_URL,
+                    "tools": [t["function"]["name"] for t in REGISTRY.tools()],
+                })
+            if self.command == "GET" and path == "/v1/models":
+                return self._models()
+            if self.command == "POST" and path == "/v1/chat/completions":
+                return self._chat(body)
+            self._relay(body)
+        except ClientGone:
+            self.close_connection = True
+        except Exception as exc:  # never leave the caller hanging on a bug
+            log("gateway error on {} {}: {!r}".format(self.command, self.path, exc))
+            self.close_connection = True
             try:
-                json_response(self, 200, request_json(UPSTREAM_BASE_URL + "/models"))
-            except Exception as exc:
-                if MODEL_LIST_FALLBACK:
-                    payload = fallback_models_response()
-                    payload["agent_gateway_warning"] = str(exc)
-                    json_response(self, 200, payload)
-                else:
-                    json_response(self, 502, {"error": str(exc)})
-            return
-        json_response(self, 404, {"error": "not found"})
+                Sink(self).json(500, {"error": "gateway error"})
+            except ClientGone:
+                pass
 
-    def do_POST(self):
-        started = now_ms()
-        path = urllib.parse.urlparse(self.path).path.rstrip("/") or "/"
-        if path != "/v1/chat/completions":
-            json_response(self, 404, {"error": "not found"})
-            return
+    do_GET = do_POST = do_PUT = do_DELETE = do_PATCH = do_OPTIONS = do_HEAD = _route
+
+    # ---- handlers ------------------------------------------------------------------
+    def _chat(self, body):
+        sink = Sink(self)
         try:
-            payload = read_json_request(self)
-            wants_stream = bool(payload.get("stream"))
-            response = chat_completions(payload)
-            assert_non_empty(response)
-            response.setdefault("agent_gateway", {})["latency_ms"] = now_ms() - started
-            if wants_stream:
-                stream_chat_response(self, response)
-                return
-            json_response(self, 200, response)
-        except json.JSONDecodeError as exc:
-            json_response(self, 400, {"error": "invalid json", "detail": str(exc)})
+            payload = json.loads(body or b"{}")
+            if not isinstance(payload, dict):
+                raise ValueError("body must be a JSON object")
         except ValueError as exc:
-            json_response(self, 400, {"error": str(exc)})
-        except (EmptyCompletionError, OSError, urllib.error.URLError) as exc:
-            json_response(self, 502, {"error": str(exc)})
+            return sink.json(400, {"error": "invalid json", "detail": str(exc)})
+        try:
+            run_chat(self, self.listener, payload, sink)
+        except (EmptyCompletionError, UpstreamError) as exc:
+            if not sink.started:
+                sink.json(502, {"error": str(exc)})
+            else:
+                log("chat failed after the reply started: {}".format(exc))
+                sink.finish()
+
+    def _models(self):
+        sink = Sink(self)
+        headers = upstream_headers(self, self.listener)
+        try:
+            conn, resp = open_upstream("GET", UPSTREAM_PREFIX + "/models", None, headers,
+                                       HTTP_TIMEOUT_SECONDS, self.connection)
+            try:
+                raw, status = resp.read(), resp.status
+                content_type = resp.getheader("Content-Type") or "application/json; charset=utf-8"
+            finally:
+                conn.close()
+            if status == 200:
+                return sink.json(200, raw, content_type)
+            error = "upstream returned HTTP {}".format(status)
+        except UpstreamError as exc:
+            error = str(exc)
+        if MODEL_LIST_FALLBACK:
+            payload = fallback_models_response()
+            payload["agent_gateway_warning"] = error
+            return sink.json(200, payload)
+        sink.json(502, {"error": error})
+
+    def _relay(self, body):
+        """Pass any other request to the scheduler unchanged and stream the answer back."""
+        sink = Sink(self)
+        headers = upstream_headers(self, self.listener)
+        try:
+            conn, resp = open_upstream(self.command, UPSTREAM_ROOT_PREFIX + self.path, body or None, headers,
+                                       LLM_TIMEOUT_SECONDS, self.connection)
+        except UpstreamError as exc:
+            return sink.json(502, {"error": "upstream error: {}".format(exc)})
+        try:
+            self.send_response(resp.status, resp.reason)
+            for key, value in resp.getheaders():
+                if key.lower() not in HOP_BY_HOP:
+                    self.send_header(key, value)
+            self.send_header("Connection", "close")
+            self.close_connection = True
+            self.end_headers()
+            while True:
+                chunk = resp.read1(8192) if hasattr(resp, "read1") else resp.read(8192)
+                if not chunk:
+                    break
+                self.wfile.write(chunk)
+                self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            self.close_connection = True
+        finally:
+            conn.close()
+
+
+def make_listener(name, priority, caller, defaults):
+    return {"name": name, "priority": priority, "caller": caller, "defaults": defaults}
+
+
+API_LISTENER = make_listener("api", None, None, {})
+INTERNAL_LISTENER = make_listener("internal", LLM_PRIORITY, LLM_CALLER,
+                                  {"chat_template_kwargs": {"enable_thinking": False}})
+
+
+class Server(ThreadingHTTPServer):
+    daemon_threads = True
+    request_queue_size = 128
+
+
+def serve(port, listener):
+    handler = type("{}Handler".format(listener["name"].title()), (Handler,), {"listener": listener})
+    server = Server((HOST, port), handler)
+    log("agent-gateway {} listener on {}:{} -> {}".format(listener["name"], HOST, port, UPSTREAM_BASE_URL))
+    server.serve_forever()
 
 
 def main():
-    server = ThreadingHTTPServer((HOST, PORT), Handler)
-    print("agent-gateway listening on {}:{} -> {}".format(HOST, PORT, UPSTREAM_BASE_URL), flush=True)
-    server.serve_forever()
+    if INTERNAL_PORT and INTERNAL_PORT != PORT:
+        threading.Thread(target=serve, args=(INTERNAL_PORT, INTERNAL_LISTENER), daemon=True).start()
+    serve(PORT, API_LISTENER)
 
 
 def selfcheck():

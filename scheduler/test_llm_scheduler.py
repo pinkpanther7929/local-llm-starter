@@ -78,6 +78,12 @@ class SchedulerTests(unittest.TestCase):
         self.addCleanup(self.proxy.shutdown)
         self.addCleanup(self.upstream.shutdown)
 
+    def test_ip_rule_applies_to_forwarded_address(self):
+        with patch.object(sched, "TRUST_FORWARDED", True), patch.object(sched, "IP_PRIORITY", {"10.6.5.155": 1}):
+            post(self.port, {"tag": "fwd"}, {"X-Forwarded-For": "10.6.5.155"})
+        caller = self.scheduler.status()["callers"]["10.6.5.155"]
+        self.assertEqual(caller["by_priority"]["P1"], 1)
+
     def test_passthrough_get_models(self):
         conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
         conn.request("GET", "/v1/models")
@@ -142,6 +148,14 @@ class PriorityTests(unittest.TestCase):
             self.assertEqual(sched.resolve_priority("P0", "10.6.5.155"), 0)
             self.assertEqual(sched.resolve_priority(None, "10.6.5.155"), 1)
             self.assertEqual(sched.resolve_priority(None, "1.2.3.4"), 2)
+
+    def test_forwarded_address_is_used_only_when_trusted(self):
+        headers = {"X-Forwarded-For": "10.6.5.155, 172.18.0.5"}
+        with patch.object(sched, "TRUST_FORWARDED", False):
+            self.assertEqual(sched.client_ip(headers, "172.18.0.9"), "172.18.0.9")
+        with patch.object(sched, "TRUST_FORWARDED", True):
+            self.assertEqual(sched.client_ip(headers, "172.18.0.9"), "10.6.5.155")
+            self.assertEqual(sched.client_ip({}, "172.18.0.9"), "172.18.0.9")
 
     def test_aging_promotes_waiters(self):
         waiter = sched.Waiter(2, "x", 1)

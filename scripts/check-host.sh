@@ -166,10 +166,10 @@ main() {
   check_docker
   check_gpu
 
-  # Only these two are published on the host. The backend, agent-gateway and
+  # Only these two are published on the host. The scheduler, backends, tool-service and
   # SearXNG are reachable on the Docker network only.
   check_port "Open WebUI" "${OPEN_WEBUI_PORT:-3000}"
-  check_port "LLM scheduler" "${SCHED_PORT:-8000}"
+  check_port "API (agent-gateway)" "${API_PORT:-8000}"
 
   check_disk "."
   check_disk "${HOME}/.cache/huggingface"

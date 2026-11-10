@@ -190,8 +190,8 @@ services:
       - agent-gateway
       - searxng
 
-  # Priority scheduler: the only way to reach the model. Runs for every profile (strata, vllm, ollama);
-  # the backends are not published on the host, so external callers and agent-gateway all queue here.
+  # Priority scheduler: the only way to reach the model. Runs for every profile (strata, vllm, ollama).
+  # Not published on the host: agent-gateway is the entrance and every model call it makes queues here.
   # SCHED_UPSTREAM / SCHED_CONCURRENCY come from the profile env. Keep SCHED_CONCURRENCY equal to the
   # backend's own slot count (vLLM --max-num-seqs), otherwise the queue moves into the backend and
   # priorities stop applying. Defaults match the Strata profile.
@@ -204,8 +204,8 @@ services:
     container_name: local-llm-scheduler
     restart: unless-stopped
 
-    ports:
-      - "${SCHED_PORT:-8000}:8000"
+    expose:
+      - "8000"
 
     environment:
       SCHED_LISTEN_PORT: "8000"
@@ -215,6 +215,8 @@ services:
       SCHED_DEFAULT_PRIORITY: ${SCHED_DEFAULT_PRIORITY:-P2}
       SCHED_IP_PRIORITY: ${SCHED_IP_PRIORITY:-}
       SCHED_UPSTREAM_TIMEOUT: ${SCHED_UPSTREAM_TIMEOUT:-900}
+      # Only agent-gateway can reach this container, and it reports the real caller address.
+      SCHED_TRUST_FORWARDED: "true"
 
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)"]
@@ -222,8 +224,9 @@ services:
       timeout: 5s
       retries: 3
 
-  # Not published on the host: Open WebUI reaches it on the Docker network. Its only model path is
-  # llm-scheduler, fixed here so a profile env can never route around the queue.
+  # The API entrance (host port ${API_PORT:-8000}): API callers, and Open WebUI on the unpublished
+  # internal listener (8010). It runs the tool-calling loop and relays everything else unchanged.
+  # Its only model path is llm-scheduler, fixed here so a profile env can never route around the queue.
   agent-gateway:
     build:
       context: ./gateway
@@ -231,21 +234,50 @@ services:
     container_name: local-llm-agent-gateway
     restart: unless-stopped
 
+    ports:
+      - "${API_PORT:-8000}:8000"
+
     expose:
       - "8010"
 
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8010/health', timeout=3)"]
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)"]
       interval: 30s
       timeout: 5s
       retries: 3
 
     environment:
+      GATEWAY_PORT: "8000"
+      GATEWAY_INTERNAL_PORT: "8010"
       UPSTREAM_BASE_URL: http://llm-scheduler:8000/v1
+      TOOL_SERVICE_URL: http://tool-service:8020
       LLM_PRIORITY: ${LLM_PRIORITY:-P0}
       LLM_CALLER: ${LLM_CALLER:-open-webui}
-      SEARXNG_URL: http://searxng:8080/search
       DEFAULT_MODEL: ${SERVED_MODEL_NAME:-qwen-14b}
+      MAX_TOOL_ROUNDS: ${MAX_TOOL_ROUNDS:-4}
+      LLM_TIMEOUT_SECONDS: "${LLM_TIMEOUT_SECONDS:-600}"
+
+  # Capabilities the model can ask for through agent-gateway: web search, URL fetch and, when
+  # enabled, the repository (Perforce workspace mounted read-only, synced through the host broker).
+  # Not published on the host; only agent-gateway calls it.
+  tool-service:
+    build:
+      context: ./toolservice
+
+    container_name: local-llm-tool-service
+    restart: unless-stopped
+
+    expose:
+      - "8020"
+
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8020/health', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+    environment:
+      SEARXNG_URL: http://searxng:8080/search
       WEB_SEARCH_POLICY: ${WEB_SEARCH_POLICY:-keyword}
       FETCH_URL_ENABLED: ${FETCH_URL_ENABLED:-true}
       FILE_SEARCH_ENABLED: ${FILE_SEARCH_ENABLED:-false}
@@ -255,8 +287,6 @@ services:
       P4_SYNC_ENABLED: "${P4_SYNC_ENABLED:-false}"
       P4_SYNC_SOCKET: /p4-sync/sync.sock
       P4_SYNC_TIMEOUT_SECONDS: "${P4_SYNC_TIMEOUT_SECONDS:-600}"
-      MAX_TOOL_ROUNDS: ${MAX_TOOL_ROUNDS:-4}
-      LLM_TIMEOUT_SECONDS: "${LLM_TIMEOUT_SECONDS:-600}"
       UPSTREAM_RETRIES: ${UPSTREAM_RETRIES:-6}
       UPSTREAM_RETRY_DELAY_SECONDS: ${UPSTREAM_RETRY_DELAY_SECONDS:-2}
 
@@ -273,7 +303,7 @@ services:
     container_name: searxng
     restart: unless-stopped
 
-    # Not published on the host: only agent-gateway and Open WebUI reach it, on the Docker network.
+    # Not published on the host: only tool-service and Open WebUI reach it, on the Docker network.
     expose:
       - "8080"
 

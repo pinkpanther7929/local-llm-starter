@@ -1,15 +1,12 @@
 FROM python:3.12-slim
 
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends ripgrep \
-    && rm -rf /var/lib/apt/lists/*
-
 ENV PYTHONUNBUFFERED=1
 
 WORKDIR /app
 
 COPY agent_gateway.py /app/agent_gateway.py
 
-EXPOSE 8010
+# 8000: API listener (published by compose). 8010: internal listener for Open WebUI.
+EXPOSE 8000 8010
 
 CMD ["python", "/app/agent_gateway.py"]

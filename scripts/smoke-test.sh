@@ -65,13 +65,17 @@ http_get() {
 }
 
 internal_get() {
-  docker exec "${GATEWAY_CONTAINER}" python -c     'import sys, urllib.request; sys.stdout.write(urllib.request.urlopen(sys.argv[1], timeout=int(sys.argv[2])).read().decode("utf-8", "replace"))'     "$1" "${TIMEOUT}"
+  docker exec "${GATEWAY_CONTAINER}" python -c \
+    'import sys, urllib.request; sys.stdout.write(urllib.request.urlopen(sys.argv[1], timeout=int(sys.argv[2])).read().decode("utf-8", "replace"))' \
+    "$1" "${TIMEOUT}"
 }
 
 internal_post_json() {
   local url="$1"
   local data="$2"
-  printf '%s' "${data}" | docker exec -i "${GATEWAY_CONTAINER}" python -c     'import sys, urllib.request; req = urllib.request.Request(sys.argv[1], data=sys.stdin.buffer.read(), headers={"Content-Type": "application/json"}); sys.stdout.write(urllib.request.urlopen(req, timeout=int(sys.argv[2])).read().decode("utf-8", "replace"))'     "${url}" "${CHAT_TIMEOUT}"
+  printf '%s' "${data}" | docker exec -i "${GATEWAY_CONTAINER}" python -c \
+    'import sys, urllib.request; req = urllib.request.Request(sys.argv[1], data=sys.stdin.buffer.read(), headers={"Content-Type": "application/json"}); sys.stdout.write(urllib.request.urlopen(req, timeout=int(sys.argv[2])).read().decode("utf-8", "replace"))' \
+    "${url}" "${CHAT_TIMEOUT}"
 }
 
 http_post_json() {
@@ -153,14 +157,24 @@ check_gateway() {
 }
 
 check_backend() {
-  # The backend is not published; the scheduler is the only way in and relays /v1/models.
-  local port="${SCHED_PORT:-8000}"
+  # The backend is not published; the gateway relays /v1/models through the scheduler.
+  local port="${API_PORT:-8000}"
 
   local response
   if response="$(http_get "http://${HOST}:${port}/v1/models" 2>&1)"; then
-    check_json_field "scheduler -> backend /v1/models on port ${port}" "${response}" '"data"'
+    check_json_field "gateway -> scheduler -> backend /v1/models on port ${port}" "${response}" '"data"'
   else
-    fail "scheduler -> backend /v1/models on port ${port}"
+    fail "gateway -> scheduler -> backend /v1/models on port ${port}"
+    printf '%s\n' "${response}" | sed 's/^/[debug] /'
+  fi
+}
+
+check_tool_service() {
+  local response
+  if response="$(internal_get "http://tool-service:8020/health" 2>&1)"; then
+    check_json_field "tool-service /health" "${response}" '"ok"'
+  else
+    fail "tool-service /health"
     printf '%s\n' "${response}" | sed 's/^/[debug] /'
   fi
 }
@@ -200,6 +214,7 @@ main() {
   load_env
   check_gateway
   check_backend
+  check_tool_service
   check_searxng
   check_open_webui
 

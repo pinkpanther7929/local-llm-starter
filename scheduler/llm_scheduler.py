@@ -9,6 +9,9 @@ passed through without queueing.
 Priority comes from the `X-LLM-Priority` header (trusted as-is, LAN only). Without
 it the source-IP map (SCHED_IP_PRIORITY) and then SCHED_DEFAULT_PRIORITY apply.
 `X-Caller` is only a label for the status page.
+
+Callers reach the scheduler through agent-gateway, which sends the real address in
+`X-Forwarded-For`; with SCHED_TRUST_FORWARDED=true the IP rules use that address.
 """
 import hashlib
 import http.client
@@ -29,6 +32,9 @@ CONCURRENCY = max(1, int(os.environ.get("SCHED_CONCURRENCY", "1")))
 AGING_SEC = float(os.environ.get("SCHED_AGING_SEC", "120"))
 DEFAULT_PRIORITY = os.environ.get("SCHED_DEFAULT_PRIORITY", "P2")
 UPSTREAM_TIMEOUT = float(os.environ.get("SCHED_UPSTREAM_TIMEOUT", "900"))
+# agent-gateway is the only thing that reaches the scheduler and it reports the real caller in
+# X-Forwarded-For. Only turn this on while the scheduler is not published on the host.
+TRUST_FORWARDED = os.environ.get("SCHED_TRUST_FORWARDED", "false").lower() in {"1", "true", "yes"}
 QUEUED_PATHS = {"/v1/chat/completions", "/v1/completions"}
 HOP_BY_HOP = {"connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "te",
               "trailers", "transfer-encoding", "upgrade", "content-length", "host"}
@@ -55,6 +61,15 @@ def parse_ip_map(text):
 
 
 IP_PRIORITY = parse_ip_map(os.environ.get("SCHED_IP_PRIORITY", ""))
+
+
+def client_ip(headers, peer):
+    """Address the source-IP rules apply to: the first X-Forwarded-For hop when a trusted proxy sent it."""
+    if TRUST_FORWARDED:
+        forwarded = (headers.get("X-Forwarded-For") or "").split(",")[0].strip()
+        if forwarded:
+            return forwarded
+    return peer
 
 
 def resolve_priority(header_value, client_ip):
@@ -231,8 +246,9 @@ class Handler(BaseHTTPRequestHandler):
         path = urllib.parse.urlparse(self.path).path.rstrip("/")
         if path not in QUEUED_PATHS:
             return self._forward(body)
-        priority = resolve_priority(self.headers.get("X-LLM-Priority"), self.client_address[0])
-        caller = (self.headers.get("X-Caller") or self.client_address[0]).strip()[:64] or "unknown"
+        source = client_ip(self.headers, self.client_address[0])
+        priority = resolve_priority(self.headers.get("X-LLM-Priority"), source)
+        caller = (self.headers.get("X-Caller") or source).strip()[:64] or "unknown"
         self.scheduler.note_prefix(caller, body)
         waiter = self.scheduler.enqueue(priority, caller)
         while not waiter.event.wait(1.0):
