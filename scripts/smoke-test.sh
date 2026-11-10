@@ -11,6 +11,9 @@ if [[ -z "${ENV_FILE}" ]]; then
 fi
 
 HOST="${SMOKE_HOST:-localhost}"
+# agent-gateway and SearXNG are not published on the host; they are probed from
+# inside the gateway container, which sits on the same Docker network.
+GATEWAY_CONTAINER="${GATEWAY_CONTAINER:-local-llm-agent-gateway}"
 TIMEOUT="${SMOKE_TIMEOUT:-20}"
 CHAT_TIMEOUT="${SMOKE_CHAT_TIMEOUT:-90}"
 CHAT_PROMPT="${SMOKE_CHAT_PROMPT:-Reply with exactly: local-llm-ok}"
@@ -61,6 +64,16 @@ http_get() {
   curl -fsS --max-time "${TIMEOUT}" "${url}"
 }
 
+internal_get() {
+  docker exec "${GATEWAY_CONTAINER}" python -c     'import sys, urllib.request; sys.stdout.write(urllib.request.urlopen(sys.argv[1], timeout=int(sys.argv[2])).read().decode("utf-8", "replace"))'     "$1" "${TIMEOUT}"
+}
+
+internal_post_json() {
+  local url="$1"
+  local data="$2"
+  printf '%s' "${data}" | docker exec -i "${GATEWAY_CONTAINER}" python -c     'import sys, urllib.request; req = urllib.request.Request(sys.argv[1], data=sys.stdin.buffer.read(), headers={"Content-Type": "application/json"}); sys.stdout.write(urllib.request.urlopen(req, timeout=int(sys.argv[2])).read().decode("utf-8", "replace"))'     "${url}" "${CHAT_TIMEOUT}"
+}
+
 http_post_json() {
   local url="$1"
   local data="$2"
@@ -101,11 +114,10 @@ PY
 }
 
 check_gateway() {
-  local port="${AGENT_GATEWAY_PORT:-8010}"
-  local base="http://${HOST}:${port}"
+  local base="http://127.0.0.1:8010"
   local response
 
-  if response="$(http_get "${base}/health" 2>&1)"; then
+  if response="$(internal_get "${base}/health" 2>&1)"; then
     check_json_field "agent gateway /health" "${response}" '"ok"'
   else
     fail "agent gateway /health"
@@ -113,7 +125,7 @@ check_gateway() {
     return
   fi
 
-  if response="$(http_get "${base}/v1/models" 2>&1)"; then
+  if response="$(internal_get "${base}/v1/models" 2>&1)"; then
     check_json_field "agent gateway /v1/models" "${response}" '"data"'
   else
     fail "agent gateway /v1/models"
@@ -127,7 +139,7 @@ check_gateway() {
 
   local payload
   payload="$(json_payload)"
-  if response="$(http_post_json "${base}/v1/chat/completions" "${payload}" 2>&1)"; then
+  if response="$(internal_post_json "${base}/v1/chat/completions" "${payload}" 2>&1)"; then
     # Non-empty content, not just the presence of "choices". A GPU that has
     # fallen off the bus still returns a well-formed completion with an empty
     # content, which passed this check for three hours on 2026-08-24. This is
@@ -141,27 +153,21 @@ check_gateway() {
 }
 
 check_backend() {
-  local profile="${COMPOSE_PROFILES:-vllm}"
-  local port
-  if [[ "${profile}" == *"ollama"* ]]; then
-    port="${OLLAMA_PORT:-11434}"
-  else
-    port="${VLLM_PORT:-8000}"
-  fi
+  # The backend is not published; the scheduler is the only way in and relays /v1/models.
+  local port="${SCHED_PORT:-8000}"
 
   local response
   if response="$(http_get "http://${HOST}:${port}/v1/models" 2>&1)"; then
-    check_json_field "backend /v1/models on port ${port}" "${response}" '"data"'
+    check_json_field "scheduler -> backend /v1/models on port ${port}" "${response}" '"data"'
   else
-    fail "backend /v1/models on port ${port}"
+    fail "scheduler -> backend /v1/models on port ${port}"
     printf '%s\n' "${response}" | sed 's/^/[debug] /'
   fi
 }
 
 check_searxng() {
-  local port="${SEARXNG_PORT:-8081}"
   local response
-  if response="$(http_get "http://${HOST}:${port}/search?q=vllm&format=json" 2>&1)"; then
+  if response="$(internal_get "http://searxng:8080/search?q=vllm&format=json" 2>&1)"; then
     check_json_field "SearXNG JSON search" "${response}" '"results"'
   else
     fail "SearXNG JSON search"
@@ -183,6 +189,11 @@ check_open_webui() {
 main() {
   if ! has_cmd curl; then
     fail "curl is not installed"
+    exit 1
+  fi
+
+  if ! has_cmd docker; then
+    fail "docker is not installed (agent-gateway and SearXNG are probed through it)"
     exit 1
   fi
 

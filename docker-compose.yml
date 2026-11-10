@@ -16,8 +16,9 @@ services:
     ipc: host
     shm_size: "16gb"
 
-    ports:
-      - "${VLLM_PORT:-8000}:8000"
+    # Not published on the host: llm-scheduler owns host port 8000 and forwards to vllm:8000 on the Docker network.
+    expose:
+      - "8000"
 
     volumes:
       - ~/.cache/huggingface:/root/.cache/huggingface
@@ -144,8 +145,9 @@ services:
     container_name: ollama
     restart: unless-stopped
 
-    ports:
-      - "${OLLAMA_PORT:-11434}:11434"
+    # Not published on the host: llm-scheduler forwards to ollama:11434 on the Docker network.
+    expose:
+      - "11434"
 
     volumes:
       - ollama:/root/.ollama
@@ -188,13 +190,14 @@ services:
       - agent-gateway
       - searxng
 
-  # Priority scheduler in front of Strata: the only entrance on host port 8000 (Strata is internal).
-  # agent-gateway must use UPSTREAM_BASE_URL=http://llm-scheduler:8000/v1 so Open WebUI queues too.
-  # Rollback: restore `ports: ["8000:8000"]` on strata, SCHED_PORT=8020, UPSTREAM_BASE_URL=http://strata:8000/v1.
+  # Priority scheduler: the only way to reach the model. Runs for every profile (strata, vllm, ollama);
+  # the backends are not published on the host, so external callers and agent-gateway all queue here.
+  # SCHED_UPSTREAM / SCHED_CONCURRENCY come from the profile env. Keep SCHED_CONCURRENCY equal to the
+  # backend's own slot count (vLLM --max-num-seqs), otherwise the queue moves into the backend and
+  # priorities stop applying. Defaults match the Strata profile.
+  # There is no depends_on: a backend from an inactive profile cannot be a dependency. Until the
+  # backend is up the scheduler answers 502.
   llm-scheduler:
-    profiles:
-      - strata
-
     build:
       context: ./scheduler
 
@@ -213,9 +216,14 @@ services:
       SCHED_IP_PRIORITY: ${SCHED_IP_PRIORITY:-}
       SCHED_UPSTREAM_TIMEOUT: ${SCHED_UPSTREAM_TIMEOUT:-900}
 
-    depends_on:
-      - strata
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
 
+  # Not published on the host: Open WebUI reaches it on the Docker network. Its only model path is
+  # llm-scheduler, fixed here so a profile env can never route around the queue.
   agent-gateway:
     build:
       context: ./gateway
@@ -223,11 +231,17 @@ services:
     container_name: local-llm-agent-gateway
     restart: unless-stopped
 
-    ports:
-      - "${AGENT_GATEWAY_PORT:-8010}:8010"
+    expose:
+      - "8010"
+
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8010/health', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
 
     environment:
-      UPSTREAM_BASE_URL: ${UPSTREAM_BASE_URL:-http://vllm:8000/v1}
+      UPSTREAM_BASE_URL: http://llm-scheduler:8000/v1
       LLM_PRIORITY: ${LLM_PRIORITY:-P0}
       LLM_CALLER: ${LLM_CALLER:-open-webui}
       SEARXNG_URL: http://searxng:8080/search
@@ -259,11 +273,12 @@ services:
     container_name: searxng
     restart: unless-stopped
 
-    ports:
-      - "${SEARXNG_PORT:-8081}:8080"
+    # Not published on the host: only agent-gateway and Open WebUI reach it, on the Docker network.
+    expose:
+      - "8080"
 
     environment:
-      BASE_URL: ${SEARXNG_PUBLIC_URL:-http://localhost:8081/}
+      BASE_URL: ${SEARXNG_PUBLIC_URL:-http://searxng:8080/}
       INSTANCE_NAME: local-llm-search
 
     volumes:

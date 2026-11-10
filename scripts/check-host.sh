@@ -166,14 +166,10 @@ main() {
   check_docker
   check_gpu
 
+  # Only these two are published on the host. The backend, agent-gateway and
+  # SearXNG are reachable on the Docker network only.
   check_port "Open WebUI" "${OPEN_WEBUI_PORT:-3000}"
-  check_port "agent gateway" "${AGENT_GATEWAY_PORT:-8010}"
-  check_port "SearXNG" "${SEARXNG_PORT:-8081}"
-  if [[ "${COMPOSE_PROFILES:-vllm}" == *"ollama"* ]]; then
-    check_port "Ollama" "${OLLAMA_PORT:-11434}"
-  else
-    check_port "vLLM" "${VLLM_PORT:-8000}"
-  fi
+  check_port "LLM scheduler" "${SCHED_PORT:-8000}"
 
   check_disk "."
   check_disk "${HOME}/.cache/huggingface"
